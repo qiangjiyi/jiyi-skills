@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>会话分析报告</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1d2129; --sub:#86909c;
+    --line:#e5e6eb; --green:#00b42a; --orange:#ff7d00; --red:#f53f3f;
+    --accent:#165dff; --accent-bg:#e8f3ff; --orphan-bg:#fff7e8;
+    --radius:14px; --shadow:0 1px 3px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.04);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"SF Pro SC","PingFang SC",system-ui,sans-serif;
+    background:var(--bg);color:var(--ink);line-height:1.6;padding:32px 20px 80px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1100px;margin:0 auto}
+  header{margin-bottom:24px}
+  h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
+  .meta{color:var(--sub);font-size:13px;margin-top:6px}
+  .lead{background:var(--accent-bg);border-radius:10px;padding:12px 16px;font-size:14px;margin-top:14px}
+
+  .overview{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:14px}
+  .ocard{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px}
+  .ocard.off{opacity:.55}
+  .ocard .name{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .ocard .big{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums;margin:8px 0 2px}
+  .ocard .sub{font-size:12px;color:var(--sub)}
+  .ocard .orphan{color:var(--orange);font-weight:600}
+  .totals{display:flex;gap:28px;flex-wrap:wrap;background:var(--card);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:16px 20px;margin-bottom:24px}
+  .totals .k{font-size:12px;color:var(--sub)} .totals .v{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
+
+  .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);
+    margin-bottom:18px;overflow:hidden}
+  .shead{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;
+    justify-content:space-between;flex-wrap:wrap;gap:8px}
+  .shead .left{display:flex;flex-direction:column;gap:2px}
+  .shead .title{font-size:17px;font-weight:700}
+  .shead .root{font-size:12px;color:var(--sub);font-family:ui-monospace,Menlo,monospace}
+  .shead .nums{font-size:13px;color:var(--sub)}
+  .note{background:var(--orphan-bg);color:#a05a00;font-size:13px;padding:10px 20px;border-bottom:1px solid var(--line)}
+  .pad{padding:8px 14px 14px}
+
+  details.proj{border:1px solid var(--line);border-radius:10px;margin:8px 0;overflow:hidden}
+  details.proj[open]{box-shadow:0 1px 4px rgba(0,0,0,.04)}
+  summary.prow{list-style:none;cursor:pointer;padding:11px 14px;display:flex;align-items:center;
+    gap:10px;user-select:none}
+  summary.prow::-webkit-details-marker{display:none}
+  .caret{transition:transform .15s;color:var(--sub);font-size:11px}
+  details[open] .caret{transform:rotate(90deg)}
+  .plabel{flex:1;min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-family:ui-monospace,Menlo,monospace}
+  .badge{font-size:11px;padding:2px 7px;border-radius:6px;white-space:nowrap}
+  .badge.orphan{background:var(--orphan-bg);color:var(--orange)}
+  .pmeta{font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  .srow{display:flex;align-items:center;gap:10px;padding:9px 14px 9px 30px;border-top:1px dashed var(--line);font-size:13px}
+  .stitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .stitle .id{color:var(--sub);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-right:6px}
+  .tag{font-size:10px;color:var(--sub);border:1px solid var(--line);border-radius:5px;padding:0 5px;margin-right:4px}
+  .smeta{font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  button.del{border:1px solid var(--line);background:#fff;color:var(--red);border-radius:7px;
+    padding:4px 10px;font-size:12px;cursor:pointer;white-space:nowrap}
+  button.del:hover{background:#fff1f0;border-color:var(--red)}
+  button.del.proj{color:#a05a00} button.del.proj:hover{background:var(--orphan-bg);border-color:var(--orange)}
+  button.del:disabled{opacity:.5;cursor:default}
+  .empty{padding:14px 20px;color:var(--sub);font-size:13px}
+  .readonly{padding:10px 20px;color:var(--sub);font-size:13px;background:#fafafa}
+
+  #toast{position:fixed;left:50%;bottom:32px;transform:translateX(-50%);background:#1d2129;color:#fff;
+    padding:11px 18px;border-radius:10px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw}
+  #toast.show{opacity:1}
+  #toast.err{background:var(--red)}
+
+  #modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;
+    justify-content:center;z-index:50}
+  #modal.show{display:flex;animation:fadeIn .15s}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  .mcard{background:var(--card);border-radius:var(--radius);box-shadow:0 8px 32px rgba(0,0,0,.18);
+    max-width:440px;width:calc(100% - 40px);padding:24px 26px;animation:pop .18s}
+  @keyframes pop{from{transform:scale(.96);opacity:0}to{transform:scale(1);opacity:1}}
+  .mtitle{font-size:16px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+  .mbody{font-size:13.5px;color:var(--ink);line-height:1.65;white-space:pre-line;margin-bottom:18px;
+    font-family:ui-monospace,Menlo,monospace;background:#fafbfc;border-radius:8px;padding:10px 12px}
+  .mbody .warn{color:var(--red);font-weight:600}
+  .mbody .soft{color:var(--orange);font-weight:500}
+  .mactions{display:flex;gap:10px;justify-content:flex-end}
+  .mbtn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;
+    padding:7px 16px;font-size:13px;cursor:pointer;font-weight:500}
+  .mbtn:hover{background:#fafafa}
+  .mbtn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .mbtn.primary:hover{background:#0e4dd9}
+  .mbtn.danger{background:var(--red);color:#fff;border-color:var(--red)}
+  .mbtn.danger:hover{background:#e0353a}
+  .mbtn:focus{outline:2px solid var(--accent-bg);outline-offset:1px}
+  @media(max-width:760px){.overview{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>会话分析报告</h1>
+    <div class="meta" id="meta"></div>
+    <div class="lead" id="lead"></div>
+  </header>
+  <div class="overview" id="overview"></div>
+  <div class="totals" id="totals"></div>
+  <div id="sections"></div>
+</div>
+<div id="toast"></div>
+<div id="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle"></div>
+
+<script>
+const DATA = __REPORT_DATA__;
+const CFG  = __DELETE_CONFIG__;
+const ICON = {codex:"🟦", antigravity:"🛰️", claude:"🟧"};
+
+function fmt(b){ if(b<1024) return b+" B"; const u=["KB","MB","GB","TB"]; let i=-1,n=b;
+  do{ n/=1024; i++; }while(n>=1024 && i<u.length-1); return n.toFixed(n<10?2:1)+" "+u[i]; }
+function fdate(ts){ if(!ts) return ""; const d=new Date(ts*1000);
+  const p=x=>String(x).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function el(html){ const t=document.createElement("template"); t.innerHTML=html.trim(); return t.content.firstElementChild; }
+
+function toast(msg, isErr){ const t=document.getElementById("toast"); t.textContent=msg;
+  t.className=isErr?"show err":"show"; clearTimeout(toast._t); toast._t=setTimeout(()=>t.className="",2600); }
+
+function modalConfirm({title, body, confirmText="确定", cancelText="取消", danger=false}){
+  return new Promise(resolve=>{
+    const m = document.getElementById("modal");
+    m.innerHTML = `<div class="mcard">
+      <div class="mtitle" id="mtitle">${title||""}</div>
+      <div class="mbody">${body||""}</div>
+      <div class="mactions">
+        <button class="mbtn cancel" data-act="0">${cancelText}</button>
+        <button class="mbtn ${danger?"danger":"primary"} ok" data-act="1">${confirmText}</button>
+      </div></div>`;
+    m.classList.add("show");
+    document.body.style.overflow = "hidden";
+
+    const close = (v)=>{
+      m.classList.remove("show");
+      m.innerHTML = "";
+      document.body.style.overflow = "";
+      document.removeEventListener("keydown", onKey);
+      resolve(v);
+    };
+    const onKey = (e)=>{
+      if(e.key==="Escape") close(false);
+      else if(e.key==="Enter" && !e.shiftKey) close(true);
+    };
+    m.querySelector(".cancel").addEventListener("click", ()=>close(false));
+    m.querySelector(".ok").addEventListener("click", ()=>close(true));
+    m.addEventListener("click", (e)=>{ if(e.target===m) close(false); });
+    document.addEventListener("keydown", onKey);
+    setTimeout(()=>m.querySelector(".cancel").focus(), 0);
+  });
+}
+
+function installed(){ return DATA.agents.filter(a=>a.installed); }
+
+function render(){
+  document.getElementById("meta").textContent =
+    `扫描时间 ${fdate(DATA.generated_at)} · 耗时 ${DATA.scan_seconds}s · 命中 ${installed().length} 个 Agent`
+    + (CFG&&CFG.enabled? " · 删除已启用（默认移废纸篓）" : " · 只读报告");
+  renderLead(); renderOverview(); renderTotals(); renderSections();
+}
+
+function renderLead(){
+  let max=null;
+  installed().forEach(a=>{ if(!max||a.total_size>max.total_size) max=a; });
+  const orphans = installed().reduce((s,a)=>s+(a.orphan_session_count||0),0);
+  const lead=document.getElementById("lead");
+  if(!max){ lead.style.display="none"; return; }
+  lead.innerHTML = `占用最大的是 <b>${max.name}</b>（${fmt(max.total_size)} / ${max.session_count} 个会话）。`
+    + (orphans? ` 三个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个会话所属的工作目录已不存在，建议优先清理。` : "");
+}
+
+function renderOverview(){
+  const ov=document.getElementById("overview"); ov.innerHTML="";
+  DATA.agents.forEach(a=>{
+    if(!a.installed){ ov.appendChild(el(`<div class="ocard off"><div class="name">${ICON[a.key]||""} ${esc(a.name)}</div>
+      <div class="big">—</div><div class="sub">未检测到（已跳过）</div></div>`)); return; }
+    ov.appendChild(el(`<div class="ocard"><div class="name">${ICON[a.key]||""} ${esc(a.name)}</div>
+      <div class="big">${fmt(a.total_size)}</div>
+      <div class="sub">${a.project_count} 个项目 · ${a.session_count} 个会话`
+      + (a.orphan_session_count? ` · <span class="orphan">${a.orphan_session_count} 孤儿</span>`:"")
+      + `</div></div>`));
+  });
+}
+
+function renderTotals(){
+  const ts=document.getElementById("totals");
+  const size=installed().reduce((s,a)=>s+a.total_size,0);
+  const sess=installed().reduce((s,a)=>s+a.session_count,0);
+  const orph=installed().reduce((s,a)=>s+(a.orphan_session_count||0),0);
+  ts.innerHTML=`<div><div class="k">合计占用</div><div class="v">${fmt(size)}</div></div>
+    <div><div class="k">合计会话</div><div class="v">${sess}</div></div>
+    <div><div class="k">孤儿会话（工作目录已删除）</div><div class="v" style="color:var(--orange)">${orph}</div></div>`;
+}
+
+function renderSections(){
+  const box=document.getElementById("sections"); box.innerHTML="";
+  if(!CFG||!CFG.enabled){
+    box.appendChild(el(`<div class="section"><div class="readonly">只读报告：未启动本地服务，删除按钮不可用。用 server.py 打开可一键清理。</div></div>`));
+  }
+  DATA.agents.forEach(a=>{
+    if(!a.installed){ return; }
+    const sec=el(`<div class="section"></div>`);
+    const orphanBulk = (CFG&&CFG.enabled && a.orphan_session_count>0)
+      ? `<button class="del proj orphan-bulk" data-act="orphan-bulk" style="margin-left:12px">🧹 一键清理 ${a.orphan_session_count} 个孤儿会话</button>`
+      : "";
+    sec.appendChild(el(`<div class="shead">
+      <div class="left"><div class="title">${ICON[a.key]||""} ${esc(a.name)}</div>
+        <div class="root">${esc(a.root)}</div></div>
+      <div class="nums">${a.project_count} 项目 · ${a.session_count} 会话 · ${fmt(a.total_size)}${orphanBulk}</div></div>`));
+    if(a.note) sec.appendChild(el(`<div class="note">⚠️ ${esc(a.note)}</div>`));
+    if(!a.projects.length){ sec.appendChild(el(`<div class="empty">暂无会话</div>`)); box.appendChild(sec); return; }
+    const pad=el(`<div class="pad"></div>`);
+    a.projects.forEach((p,pi)=> pad.appendChild(projectEl(a,pi)));
+    sec.appendChild(pad); box.appendChild(sec);
+    // 孤儿一键清理按钮：找到刚 append 的 sec 里的按钮挂事件
+    if(CFG&&CFG.enabled){
+      const ob=sec.querySelector('[data-act="orphan-bulk"]');
+      if(ob) ob.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation();
+        doBulkOrphanClean(a.key, ob); });
+    }
+  });
+}
+
+function projectEl(a, pi){
+  const p=a.projects[pi];
+  const det=el(`<details class="proj"></details>`);
+  const orphan = p.orphan? `<span class="badge orphan">⚠ 工作目录已删除</span>`:"";
+  const delBtn = (CFG&&CFG.enabled)
+    ? `<button class="del proj" data-act="proj">删除整个项目</button>` : "";
+  const sum=el(`<summary class="prow">
+     <span class="caret">▶</span>
+     <span class="plabel" title="${esc(p.label)}">${esc(p.label)}</span>
+     ${orphan}
+     <span class="pmeta">${p.session_count} 会话 · ${fmt(p.size)}</span>
+     ${delBtn}</summary>`);
+  det.appendChild(sum);
+  p.sessions.forEach((s,si)=> det.appendChild(sessionEl(a,pi,si)));
+  if(CFG&&CFG.enabled){
+    const b=sum.querySelector('[data-act="proj"]');
+    b.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation();
+      doDelete(a.key,"project",p.id,null,p.label, a.key==="codex", b); });
+  }
+  return det;
+}
+
+function sessionEl(a, pi, si){
+  const s=a.projects[pi].sessions[si];
+  const x=s.extra||{};
+  let tags="";
+  if(x.source) tags+=`<span class="tag">${esc(x.source)}</span>`;
+  if(x.archived) tags+=`<span class="tag">已归档</span>`;
+  const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
+  const row=el(`<div class="srow">
+    <span class="stitle"><span class="id">${esc(s.id.slice(0,12))}</span>${tags}${esc(s.title)}</span>
+    <span class="smeta">${fdate(s.mtime)} · ${fmt(s.size)}</span>${delBtn}</div>`);
+  if(CFG&&CFG.enabled){
+    const b=row.querySelector('[data-act="sess"]');
+    b.addEventListener("click", ()=>doDelete(a.key,"session",a.projects[pi].id,s.id,s.title,a.key==="codex",b));
+  }
+  return row;
+}
+
+async function doDelete(agent, scope, projectId, sessionId, label, hasDb, btn){
+  if(!CFG||!CFG.enabled) return;
+  if(!await modalConfirm({
+    title: scope==="project" ? "🗑 删除整个项目？" : "🗑 删除该会话？",
+    body: `<span class="${hasDb?"warn":"soft"}">${esc(label)}</span>\n${hasDb
+      ? "⚠ Codex 会话删除不可逆：数据库行、jsonl 索引、相关文件一并永久删除（不进废纸篓）。"
+      : "将移到废纸篓（可逆）。"}`,
+    confirmText: "删除", danger: hasDb,
+  })) return;
+  btn.disabled=true; btn.textContent="处理中…";
+  try{
+    const res=await fetch(CFG.endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({token:CFG.token,agent,scope,project_id:projectId,session_id:sessionId,mode:"trash"})});
+    const j=await res.json();
+    if(!j.ok){ toast("删除失败："+(j.error||"未知错误"),true); btn.disabled=false;
+      btn.textContent=scope==="project"?"删除整个项目":"删除"; return; }
+    applyDelete(agent,scope,projectId,sessionId);
+    const n=(j.removed?j.removed.length:0);
+    toast(`已处理：移除 ${n} 个文件/目录` + (j.db_rows?"（含数据库/索引清理）":""));
+    render();
+  }catch(e){ toast("请求出错："+e.message,true); btn.disabled=false;
+    btn.textContent=scope==="project"?"删除整个项目":"删除"; }
+}
+
+async function doBulkOrphanClean(agent, btn){
+  if(!CFG||!CFG.enabled) return;
+  const a = DATA.agents.find(x=>x.key===agent); if(!a) return;
+  // 快照 orphan project id 列表：循环里 applyDelete 会改 a.projects，必须在循环外固化
+  const orphanIds = a.projects.filter(p=>p.orphan).map(p=>p.id);
+  if(!orphanIds.length) return;
+  const danger = a.key==="codex";
+  if(!await modalConfirm({
+    title: `🧹 一键清理 ${a.name} 的孤儿会话？`,
+    body: `将清理 <b>${orphanIds.length}</b> 个孤儿项目，共 <b>${a.orphan_session_count}</b> 个会话。\n${danger
+      ? "⚠ Codex 删除不可逆：数据库行、jsonl 索引、相关文件一并永久删除（不进废纸篓）。"
+      : "将移到废纸篓（可逆）。"}`,
+    confirmText: "开始清理", danger,
+  })) return;
+  btn.disabled=true;
+  let ok=0, fail=0, totalFiles=0;
+  for(let i=0; i<orphanIds.length; i++){
+    btn.textContent = `清理中 ${i+1}/${orphanIds.length}…`;
+    try{
+      const res=await fetch(CFG.endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({token:CFG.token,agent,scope:"project",project_id:orphanIds[i],session_id:null,mode:"trash"})});
+      const j=await res.json();
+      if(j.ok){
+        applyDelete(agent,"project",orphanIds[i],null);
+        ok++; totalFiles += (j.removed?j.removed.length:0);
+      } else { fail++; toast(`${orphanIds[i]}: ${j.error||"失败"}`,true); }
+    }catch(e){ fail++; toast(`${orphanIds[i]}: ${e.message}`,true); }
+  }
+  toast(`孤儿清理完成：成功 ${ok} 项${fail?` / 失败 ${fail} 项`:""}（共 ${totalFiles} 个文件/目录）`);
+  render();
+}
+
+function applyDelete(agent,scope,projectId,sessionId){
+  const a=DATA.agents.find(x=>x.key===agent); if(!a) return;
+  if(scope==="project"){ a.projects=a.projects.filter(p=>p.id!==projectId); }
+  else{
+    const p=a.projects.find(p=>p.id===projectId); if(p){
+      p.sessions=p.sessions.filter(s=>s.id!==sessionId);
+      if(!p.sessions.length){ a.projects=a.projects.filter(x=>x.id!==projectId); }
+    }
+  }
+  recalc(a);
+}
+function recalc(a){
+  a.projects.forEach(p=>{ p.session_count=p.sessions.length;
+    p.size=p.sessions.reduce((s,x)=>s+x.size,0); });
+  a.project_count=a.projects.length;
+  a.session_count=a.projects.reduce((s,p)=>s+p.session_count,0);
+  a.total_size=a.projects.reduce((s,p)=>s+p.size,0);
+  a.orphan_session_count=a.projects.filter(p=>p.orphan).reduce((s,p)=>s+p.sessions.length,0);
+}
+
+render();
+</script>
+</body>
+</html>

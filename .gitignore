@@ -1,0 +1,19 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+build/
+.cache/
+tmp/
+*.log
+.venv/
+
+# 任意层级的 docs 目录一律不开源
+docs/
+
+# 暂不开源的 skill（保留在本地，不进 git）
+/baowen-engine/
+/codex-archived-thread-cleaner/
+/commit-push/

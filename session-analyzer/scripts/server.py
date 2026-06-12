@@ -190,9 +190,7 @@ def dispatch(agent: str, scope: str, project_id: str, session_id, mode: str) -> 
     if agent == "claude":
         if proj["orphan_dir"]:
             return agent_delete.delete_claude_orphan_dir(project_id, mode)
-        return agent_delete.delete_claude_sessions(
-            project_id, ids, mode, remove_empty_dir=(scope == "project")
-        )
+        return agent_delete.delete_claude_sessions(project_id, ids, mode)
     if agent == "antigravity":
         return agent_delete.delete_antigravity_sessions(ids, mode)
     if agent == "codex":

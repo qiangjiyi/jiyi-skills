@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -110,6 +111,126 @@ def _rewrite_jsonl(path: Path, drop_ids: set, id_keys: tuple) -> int:
     return removed
 
 
+# ─────────────────────── empty-dir / orphan pruning ───────────────────────
+# 删会话只删「会话本体那一份」，但 Claude 逐会话删不收空了的 projects/<dir>、
+# Codex 删 rollout 后留空日期目录、各 Agent 历史删除也遗留过空壳/孤儿——这里统一收。
+
+# 判空时忽略的系统垃圾文件：否则只剩 .DS_Store 的目录会被当成非空，"扫了还删不干净"。
+_JUNK_NAMES = {".DS_Store", "Thumbs.db", ".localized"}
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_PID_RE = re.compile(r"^\d+$")
+
+
+def prune_roots() -> dict:
+    """各 Agent「会残留空子目录」的清理根。清理只在这些子树内自底向上进行，绝不删
+    根本身，也绝不越界——空目录有时是程序占位，范围必须收死。"""
+    cl, ag, cx = HOME / ".claude", HOME / ".gemini" / "antigravity", HOME / ".codex"
+    return {
+        "claude": [cl / "projects", cl / "session-env", cl / "file-history", cl / "tasks"],
+        "antigravity": [ag / "brain", ag / "conversations", ag / "annotations"],
+        "codex": [cx / "sessions", cx / "generated_images"],
+    }
+
+
+def _dir_empty(d: Path) -> bool:
+    try:
+        return all(c.name in _JUNK_NAMES for c in d.iterdir())
+    except OSError:
+        return False
+
+
+def prune_empty_dirs(roots, mode: str, removed: list, keep_names=None) -> None:
+    """自底向上清掉 roots 下的空目录（含只剩 .DS_Store 的），删到 root 为止，不删 root。
+    keep_names 里的目录名即使为空也保留——护住活跃会话的卫星目录（session-env/
+    file-history/tasks 下以活跃 sid 命名的目录）和 Claude 的 memory 持久目录。否则空目录
+    清理会无差别地把活跃会话恰好为空的卫星目录一并收掉，绕过 _claude_live_sids() 保护。"""
+    keep = keep_names or set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for cur, _d, _f in os.walk(root, topdown=False):  # 先到最深层，删完叶子父目录可能也空
+            p = Path(cur)
+            if p != root and p.name not in keep and _dir_empty(p):
+                try:
+                    remove_path(p, mode, removed)
+                except Exception:
+                    pass
+
+
+def _claude_live_sids() -> set:
+    """projects 下现存会话的 sid 全集（.jsonl 文件名 + 子目录名），作为孤儿判定基准。"""
+    proj = HOME / ".claude" / "projects"
+    live = set()
+    if proj.is_dir():
+        for pdir in proj.iterdir():
+            if not pdir.is_dir():
+                continue
+            for f in pdir.glob("*.jsonl"):
+                live.add(f.stem)
+            for f in pdir.iterdir():
+                if f.is_dir():
+                    live.add(f.name)
+    return live
+
+
+def prune_claude_satellites(mode: str, removed: list) -> list:
+    """清掉 session-env / file-history / tasks 里「对应会话已不在 projects」的卫星孤儿。
+    只动 uuid 形态的名字，删走废纸篓（可逆）；返回被清掉的 sid。"""
+    root = HOME / ".claude"
+    if not (root / "projects").is_dir():
+        return []
+    live = _claude_live_sids()
+    orphans = []
+    for sub in ("session-env", "file-history", "tasks"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for item in d.iterdir():
+            if not _UUID_RE.match(item.name) or item.name in live:
+                continue
+            try:
+                remove_path(item, mode, removed)
+                orphans.append(item.name)
+            except Exception:
+                pass
+    return orphans
+
+
+def _proc_name(pid: int) -> str | None:
+    """pid 对应进程名；进程不存在返回 ""；无法查询（如非类 Unix、ps 不可用）返回 None。"""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()  # 空串 = 进程不存在；ps 缺失时上面已返回 None
+
+
+def prune_claude_session_state(mode: str, removed: list) -> list:
+    """清掉 ~/.claude/sessions/<pid>.json 里「pid 进程已不存在、或 pid 被非 Claude 进程
+    复用」的陈旧运行时状态文件——某个 Claude CLI 异常退出没清掉自己的状态文件时留下的残渣。
+    活着的 claude 进程对应文件一律保留（含当前正在跑的会话自身）。无法查询进程名（非类
+    Unix 环境）时保守保留、绝不误删。删走废纸篓（可逆）；返回被清掉的 <pid>.json 文件名。"""
+    d = HOME / ".claude" / "sessions"
+    if not d.is_dir():
+        return []
+    stale = []
+    for item in d.iterdir():
+        if not (item.is_file() and item.suffix == ".json" and _PID_RE.match(item.stem)):
+            continue
+        name = _proc_name(int(item.stem))
+        if name is None:                        # 查不了进程名 → 保守保留
+            continue
+        if name and "claude" in name.lower():   # 活着的 claude 进程 → 保留
+            continue
+        try:                                    # 进程不存在(name=="")或被复用 → 孤儿
+            remove_path(item, mode, removed)
+            stale.append(item.name)
+        except Exception:
+            pass
+    return stale
+
+
 # ─────────────────────────── Claude Code ───────────────────────────
 
 def _claude_session_paths(root: Path, project_dirname: str, sid: str) -> list:
@@ -123,7 +244,7 @@ def _claude_session_paths(root: Path, project_dirname: str, sid: str) -> list:
     ]
 
 
-def delete_claude_sessions(project_dirname: str, sids: list, mode: str, *, remove_empty_dir=False) -> dict:
+def delete_claude_sessions(project_dirname: str, sids: list, mode: str) -> dict:
     root = HOME / ".claude"
     removed, errors = [], []
     for sid in sids:
@@ -133,13 +254,9 @@ def delete_claude_sessions(project_dirname: str, sids: list, mode: str, *, remov
             except Exception as e:
                 errors.append(f"{p}: {e}")
     history_rows = _rewrite_jsonl(root / "history.jsonl", set(sids), ("sessionId",))
-    if remove_empty_dir:
-        pdir = root / "projects" / project_dirname
-        if pdir.exists():
-            try:
-                remove_path(pdir, mode, removed)
-            except Exception as e:
-                errors.append(f"{pdir}: {e}")
+    # 收尾：删完后 projects/<dir>（及 session-env 等）里空了的目录一并收掉——逐会话删
+    # 到最后一个时目录就空了，这正是空目录残留的根因，不再依赖调用方传 remove_empty_dir。
+    prune_empty_dirs(prune_roots()["claude"], mode, removed, _claude_live_sids() | {"memory"})
     return {"removed": removed, "history_rows": history_rows, "errors": errors}
 
 
@@ -176,6 +293,7 @@ def delete_antigravity_sessions(uuids: list, mode: str) -> dict:
     except Exception as e:
         errors.append(f"{index_pb}: {e}")
         idx_removed = []
+    prune_empty_dirs(prune_roots()["antigravity"], mode, removed)  # 收尾：清删空了的卫星目录
     return {"removed": removed, "errors": errors, "index_removed": idx_removed}
 
 
@@ -275,6 +393,9 @@ def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
             errors.append(f"{db_name}: {e}")
         finally:
             c.close()
+    # 收尾：删 rollout 后 sessions/YYYY/MM/DD 可能空，generated_images/<tid> 也已整删——
+    # 自底向上收掉空日期目录（codex 文件级软删无意义，空目录同样硬删，与上文一致）。
+    prune_empty_dirs(prune_roots()["codex"], file_mode, removed)
     return {"removed": removed, "errors": errors, "db_rows": db_rows}
 
 

@@ -15,7 +15,8 @@ description: >
 # Session Analyzer
 
 对本机三个 AI Agent（Codex / Antigravity / Claude Code）的会话数据做一次只读分析，
-生成交互式 HTML 报告，并可在网页上一键删除。流程：可选关 app → 扫描 → 出报告（默认带删除）。
+生成交互式 HTML 报告，并可在网页上一键删除。**确定性管线：先只读扫描 → 固定决策 → 固定执行**
+（关 app / 兜底清理 / 报告形态都按写死的默认值跑，不再用 AskUserQuestion 询问；仅当用户主动要求偏离时才调整对应项）。
 
 与 storage-analyzer 同构：**一个模板 + 两个入口**。模板 `report_template.html` 看注入的
 `__DELETE_CONFIG__` 决定渲染成只读还是带删除按钮——`build_report.py` 注入 `null`（静态、
@@ -26,6 +27,11 @@ description: >
 
 - **扫描只读。** `scan.py` 只做 `os.scandir`/`stat`/只读 SQLite SELECT/读 jsonl，绝不写盘。
   删除只发生在 `server.py`（经 `agent_delete.py`），且只删扫描里出现过的会话/项目。
+  唯一的例外是扫描**之前**的 `precleanup.py`：它清空目录/卫星孤儿（默认废纸篓、可逆），
+  但 `scan.py` 本身仍严格只读。
+- **清理范围收死。** 空目录/孤儿清理只在各 Agent 自己的数据子树内自底向上进行
+  （`agent_delete.prune_roots()` 列出的根），绝不删根本身、绝不越界——空目录有时是程序占位。
+  判空时忽略 `.DS_Store`/`Thumbs.db`，否则只剩系统垃圾文件的目录会"扫了还删不干净"。
 - **删除安全模型（server.py）。** 绑 127.0.0.1 + 随机端口 + 随机 token；每个 POST 校验
   token + Host（挡 DNS-rebinding）；只接受扫描里存在的 `(agent, scope, project_id, session_id)`，
   客户端无法指定任意路径/id；每个处理器只碰该 Agent 自己的数据目录。
@@ -36,20 +42,14 @@ description: >
 
 ## 执行流程
 
-### Step 0（可选）关闭 Codex / Antigravity
+**确定性管线，三段式：先扫描 → 固定决策 → 固定执行。** 全程无 act-vs-ask 分支：开场永远先
+只读扫描（不问、不可选）；扫到东西就按**写死的默认决策**直接往下跑，**不再用 AskUserQuestion
+询问**。默认决策恒为：① 关闭 Codex / Antigravity，② 开场兜底清理，③ 生成可删除交互报告——
+三项全做。**禁止**把关 app、兜底清理、报告形态当成可选项临场询问或边走边拍——那正是流程每次跑
+都漂移的根源。**唯一的偏离来源**：用户在对话里主动提出（如「别关 app」「只要只读静态报告」
+「都不要，只看摘要」）时，才按用户所说调整对应项；用户没说就一律走默认、不主动反问。
 
-```bash
-python3 scripts/close_agents.py
-```
-
-`close_agents.py` 先 `osascript quit` 优雅退出、等不到再 `pkill` 强制结束，**只关这两个
-app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 Codex 正在运行，
-即将自动关闭 Codex…」「✓ 已关闭 Codex」），**agent 要把这些信息如实转述给用户**。
-
-只读扫描本身不强制要求关闭这两个 app——放在开头是让用户尽早看到「要不要先关」，
-避免看完报告去手工删时撞到 app 占用。
-
-### Step 1 只读扫描
+### Step 1 始终先做：只读扫描（不问、不可选）
 
 ```bash
 python3 scripts/scan.py > /tmp/session_scan.json
@@ -61,21 +61,79 @@ JSON：每个 Agent → 项目 → 会话三级，含每层 size、会话数、m
 `scan.py` 在 stderr 还会打一行自检 `[scan] agents=N sessions=... orphans=... size=...
 in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行稳定输出 `✓ DONE`。
 **空态快通道**：若 `sessions == 0 && orphans == 0`，stderr 多打一行
-`✓ 本机 AI 会话状态干净（0 会话 / 0 孤儿），无需清理。`——此时可**直接进入 Step 3 给摘要
-就结束**，不必生成报告。
+`✓ 本机 AI 会话状态干净（0 会话 / 0 孤儿），无需清理。`——此时**直接跳到 Step S 给摘要就结束**，
+不问决策、不生成报告。
 
 各 Agent 的会话/项目定义：
 - **Codex**（`~/.codex/`）：会话 = `state_5.sqlite` 的 `threads` 行（含 `unknown` 等所有 source）；项目按 `cwd` 聚合。
 - **Antigravity**（`~/.gemini/antigravity/`）：新版会话 = 侧栏索引 `agyhub_summaries_proto.pb` 里的每条记录（id/标题/时间/workspace 均解析自该 proto），按 workspace 路径归类成项目；兼容旧版未迁移时残留的 `conversations/<uuid>.pb`；无对应对话的 brain 目录单列「孤儿残留」。
 - **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该目录（真实路径优先从 `history.jsonl` 反查）；0-jsonl 的空目录单列为「空/孤儿目录」。
 
-### Step 2 生成报告（两个入口，默认带删除）
+### Step 2 固定决策（扫到东西直接按默认执行，不询问）
 
-**默认用一键删除模式（`server.py`）打开**，因为这个 skill 的核心价值就是网页上直接清理会话：
+先给一句结论先行的摘要（合计占用 / 占用最大的 Agent / 孤儿数），然后**不再用 AskUserQuestion
+询问**，直接按以下写死的默认决策进入 Step 3：
+
+1. **关闭 Codex / Antigravity：关。** 避免后续删除撞到 app 占用文件；只读扫描已跑完，关不关
+   都不影响结果。
+2. **开场兜底清理：清。** 跑 `precleanup.py` 清空目录 / 卫星孤儿，默认移废纸篓、可逆。
+3. **报告形态：可删除交互报告**（`server.py`，本 skill 核心价值）。
+
+> 这三项默认已固化，**无需也不要发 AskUserQuestion**。只读静态报告（`build_report.py`）/
+> 「都不要，只看摘要」仍是合法形态，但**仅当用户在对话里主动要求偏离时**才切换；用户没主动说，
+> 就一律走上面三项默认，直接进 Step 3。
+
+### Step 3 按默认固定执行（顺序写死，无分支）
+
+顺序恒为：**① 关 app → ② 兜底清理 → ③ 生成可删除交互报告 → ④ Step S 摘要。** 默认三项全做、
+逐步执行；仅当用户主动要求偏离（别关 app / 换只读报告 / 不要报告）时，才跳过或替换对应那一步。
+
+**① 关闭 Codex / Antigravity**（默认执行；用户主动说「别关」时才跳过）
 
 ```bash
-python3 scripts/server.py /tmp/session_scan.json   # 自动开浏览器，Ctrl+C 停
+python3 scripts/close_agents.py
 ```
+
+`close_agents.py` 先 `osascript quit` 优雅退出、等不到再 `pkill` 强制结束，**只关这两个
+app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 Codex 正在运行，
+即将自动关闭 Codex…」「✓ 已关闭 Codex」），**agent 要把这些信息如实转述给用户**。
+
+**② 开场兜底清理**（默认执行；用户主动说「别清」时才跳过）
+
+```bash
+python3 scripts/precleanup.py            # 默认移废纸篓（可逆）；--hard 直接删
+```
+
+清掉三个 Agent 历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
+`session-env`/`file-history`/`tasks` 里**对应会话已不存在的卫星孤儿**，以及 Claude
+`sessions/<pid>.json` 里**进程已不存在（或 pid 被非 Claude 进程复用）的陈旧运行时状态文件**
+——某个 Claude CLI 异常退出没清掉自己的状态文件时留下的残渣。这些都是删会话/退出时没收
+干净的残渣——逐会话删不收空了的 `projects/<dir>`、Codex 删 rollout 留下的空日期目录、旧
+工具遗留的空壳/孤儿——`scan.py`（只读）看不到也不展示。脚本在 stderr 列出清理项、stdout
+末行输出 `✓ DONE`，**agent 把清理条数转述给用户**。
+
+> `sessions/<pid>.json` 的判定靠 `ps -p <pid>` 双重校验：进程不存在、或进程名不含 `claude`
+> （pid 被复用）才算孤儿；活着的 claude 进程一律保留（含当前正在跑的会话自身），非类 Unix
+> 环境查不到进程名时保守保留、绝不误删。
+
+> 新产生的残渣已由删除链路就地收掉（删完会话即清空了的父目录 / 空日期目录），所以这一步
+> 主要是补历史欠账。
+
+**③ 生成报告**（默认走可删除交互报告；用户主动要求「只读静态」/「都不要」时才换形态或跳过）
+
+可删除交互报告（默认）。`server.py` 是常驻服务（`serve_forever`），**必须彻底脱离 agent 的
+输出管道后台运行**，否则会被 harness 回收（报 `exit 144`，但进程其实没死，反而堆叠出互相
+flock 死锁的僵尸实例）。固定用下面这一条起（macOS 无 `setsid`，用 `nohup` + `disown`；
+端口监听可能被沙箱拦，需关沙箱跑）：
+
+```bash
+nohup python3 -u scripts/server.py /tmp/session_scan.json </dev/null >/tmp/session-analyzer-server.log 2>&1 &
+disown
+```
+
+起好后**另起一条命令**读 `/tmp/session-analyzer-server.log` 拿 URL（形如
+`http://127.0.0.1:<port>/`）转告用户；服务的 pid:port 也写在 `/tmp/session-analyzer-server.lock`。
+脚本自带单实例约束，重复起会自动接管旧实例。用完让用户 `kill <pid>` 停（停掉后删除按钮即失效）。
 
 `server.py` 起在 127.0.0.1 + 随机端口 + 随机 token，把同一套模板注入启用态 `__DELETE_CONFIG__`。
 三栏对比三个 Agent，可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
@@ -83,22 +141,21 @@ python3 scripts/server.py /tmp/session_scan.json   # 自动开浏览器，Ctrl+C
 二次确认。删除经 `agent_delete.py`，复刻各 Agent 原始清理工具的 removal set（Codex 行+jsonl+
 卫星文件、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
 
-仅当用户明确只想要一份可分享/留存的只读文件时，才用静态模式（无删除按钮，`file://` 打开
-碰不到本地服务）：
+只读静态报告（仅分享/留存，无删除按钮，`file://` 打开碰不到本地服务）：
 
 ```bash
 python3 scripts/build_report.py /tmp/session_scan.json ~/Desktop/session-report.html && open ~/Desktop/session-report.html
 ```
 
-`build_report.py` 注入 `__DELETE_CONFIG__ = null`，渲染成纯只读报告，可直接分享/留存。默认输出
+`build_report.py` 注入 `__DELETE_CONFIG__ = null`，渲染成纯只读报告。默认输出
 `~/Desktop/session-report.html`，第二个参数可指定任意路径。
 
 **排障：网页上没有删除按钮** = 开的是静态报告（改用 `server.py`），或服务已被 Ctrl+C 停掉。
 
-### Step 3 对话里给摘要
+### Step S 对话里给摘要
 
-报告生成后，在对话里给结论先行的一段话：三个 Agent 合计占用、占用最大的 Agent、
-孤儿会话总数、最该先关注的项。细节让用户看 HTML。
+报告生成后（或空态快通道直达此处），在对话里给结论先行的一段话：三个 Agent 合计占用、
+占用最大的 Agent、孤儿会话总数、最该先关注的项。细节让用户看 HTML。
 
 **扫描 JSON 结构**（读它做摘要时照此取值，别猜——`agents` 是 **list** 不是 dict，对它用
 `.items()` 会报错）：
@@ -148,7 +205,8 @@ session-analyzer/
 ├── SKILL.md
 ├── scripts/
 │   ├── scan.py                    # 只读扫描三 Agent → JSON
-│   ├── close_agents.py            # 可选：关闭 Codex / Antigravity
+│   ├── close_agents.py            # 关闭 Codex / Antigravity（Step 2 选了才跑）
+│   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）
 │   ├── agyhub_summaries.py        # Antigravity 索引 .pb 解析 + 按 id 剔除（scan/删除共用）
 │   ├── build_report.py            # 注入 DELETE_CONFIG=null → 静态只读报告（入口一）
 │   ├── server.py                  # 本地服务，注入启用态配置 → 带删除的交互报告（入口二）

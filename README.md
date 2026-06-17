@@ -8,7 +8,8 @@
 面向 Claude Code、Codex 等支持 skills 的 Agent。
 
 已开源：[**`session-analyzer`**](session-analyzer) — 会话分析与清理 ·
-[**`skill-updater`**](skill-updater) — Skill 与插件更新同步
+[**`skill-updater`**](skill-updater) — Skill 与插件更新同步 ·
+[**`wechat-publisher`**](wechat-publisher) — 微信公众号草稿发布
 
 <br/>
 
@@ -28,12 +29,13 @@
 jiyi-skills/
 ├── session-analyzer/   # ✅ 已开源
 ├── skill-updater/      # ✅ 已开源
+├── wechat-publisher/   # ✅ 已开源
 └── README.md
 ```
 
 > 每个 skill 直接放在仓库根目录下，一个目录一个 skill，不再额外嵌套 `skills/` 层。
 
-> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer` 和 `skill-updater`，其余仍在本地迭代。
+> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer`、`skill-updater` 和 `wechat-publisher`，其余仍在本地迭代。
 
 ---
 
@@ -56,13 +58,13 @@ jiyi-skills/
 cd session-analyzer
 
 # 1. 只读扫描 → JSON
-python3 scripts/scan.py > /tmp/session_scan.json
+bash scripts/run.sh scan.py > /tmp/session_scan.json
 
 # 2. 起本地服务看报告 / 在网页上清理（Ctrl+C 停）
-python3 scripts/server.py /tmp/session_scan.json
+bash scripts/run.sh server.py /tmp/session_scan.json
 
 # 可选：导出一份只读静态报告
-python3 scripts/build_report.py /tmp/session_scan.json ~/Desktop/session-report.html
+bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-report.html
 ```
 
 **依赖**：纯 Python 3 标准库，零第三方依赖。macOS 开箱即用；Windows 代码已写但未实测（见 [SKILL.md](session-analyzer/SKILL.md)）。

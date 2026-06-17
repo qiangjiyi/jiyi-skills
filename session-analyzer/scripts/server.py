@@ -30,6 +30,7 @@ import sys
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delete  # noqa: E402
@@ -61,6 +62,18 @@ def build_index(data: dict) -> dict:
                 for s in p.get("sessions", [])
             )
             projects[p["id"]] = {"session_ids": sids, "orphan_dir": orphan_dir}
+            # Extract Multica metadata (workspace/cache paths for extra cleanup)
+            multica_meta = None
+            for s in p.get("sessions", []):
+                m = s.get("extra", {}).get("multica")
+                if m:
+                    multica_meta = {
+                        "workspace_path": p.get("multica_workspace_path"),
+                        "cache_path": p.get("multica_cache_path"),
+                        "status": m.get("status"),  # "completed" | "cleanable"
+                    }
+                    break
+            projects[p["id"]]["multica"] = multica_meta
         index[agent["key"]] = {"projects": projects}
     return index
 
@@ -188,8 +201,27 @@ def dispatch(agent: str, scope: str, project_id: str, session_id, mode: str) -> 
         raise ValueError("未知操作范围：%s" % scope)
 
     if agent == "claude":
+        multica = proj.get("multica")
         if proj["orphan_dir"]:
-            return agent_delete.delete_claude_orphan_dir(project_id, mode)
+            result = agent_delete.delete_claude_orphan_dir(project_id, mode)
+            # Also clean Multica extras for orphan dirs (cache dir may still exist)
+            if multica:
+                for key in ("workspace_path", "cache_path"):
+                    path_str = multica.get(key)
+                    if path_str:
+                        p = Path(path_str)
+                        if p.exists():
+                            try:
+                                agent_delete.remove_path(p, mode, result["removed"])
+                            except Exception as e:
+                                result["errors"].append(f"{p}: {e}")
+            return result
+        if multica:
+            return agent_delete.delete_claude_multica_sessions(
+                project_id, ids, mode,
+                workspace_path=multica.get("workspace_path"),
+                cache_path=multica.get("cache_path"),
+            )
         return agent_delete.delete_claude_sessions(project_id, ids, mode)
     if agent == "antigravity":
         return agent_delete.delete_antigravity_sessions(ids, mode)

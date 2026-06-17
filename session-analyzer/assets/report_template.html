@@ -53,6 +53,8 @@
     font-family:ui-monospace,Menlo,monospace}
   .badge{font-size:11px;padding:2px 7px;border-radius:6px;white-space:nowrap}
   .badge.orphan{background:var(--orphan-bg);color:var(--orange)}
+.badge.multica{background:#e8f3ff;color:var(--accent)}
+.badge.multica-active{background:#fff7e8;color:var(--orange)}
   .pmeta{font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;white-space:nowrap}
 
   .srow{display:flex;align-items:center;gap:10px;padding:9px 14px 9px 30px;border-top:1px dashed var(--line);font-size:13px}
@@ -197,9 +199,13 @@ function renderTotals(){
   const size=installed().reduce((s,a)=>s+a.total_size,0);
   const sess=installed().reduce((s,a)=>s+a.session_count,0);
   const orph=installed().reduce((s,a)=>s+(a.orphan_session_count||0),0);
+  const multicaCleanable=installed().reduce((s,a)=>s+(a.multica_cleanable_count||0),0);
+  const multicaActive=installed().reduce((s,a)=>s+(a.multica_active_count||0),0);
   ts.innerHTML=`<div><div class="k">合计占用</div><div class="v">${fmt(size)}</div></div>
     <div><div class="k">合计会话</div><div class="v">${sess}</div></div>
-    <div><div class="k">孤儿会话（工作目录已删除）</div><div class="v" style="color:var(--orange)">${orph}</div></div>`;
+    <div><div class="k">孤儿会话（工作目录已删除）</div><div class="v" style="color:var(--orange)">${orph}</div></div>
+    ${multicaCleanable?`<div><div class="k">Multica 可清理</div><div class="v" style="color:var(--accent)">${multicaCleanable}</div></div>`:""}
+    ${multicaActive?`<div><div class="k">Multica 不建议清理</div><div class="v" style="color:var(--orange)">${multicaActive}</div></div>`:""}`;
 }
 
 function renderSections(){
@@ -213,10 +219,14 @@ function renderSections(){
     const orphanBulk = (CFG&&CFG.enabled && a.orphan_session_count>0)
       ? `<button class="del proj orphan-bulk" data-act="orphan-bulk" style="margin-left:12px">🧹 一键清理 ${a.orphan_session_count} 个孤儿会话</button>`
       : "";
+    const multicaK = (a.multica_cleanable_count||0);
+    const multicaBulk = (CFG&&CFG.enabled && multicaK>0)
+      ? `<button class="del proj multica-bulk" data-act="multica-bulk" style="margin-left:12px">🧹 一键清理 ${multicaK} 个 Multica 可清理会话</button>`
+      : "";
     sec.appendChild(el(`<div class="shead">
       <div class="left"><div class="title">${ICON[a.key]||""} ${esc(a.name)}</div>
         <div class="root">${esc(a.root)}</div></div>
-      <div class="nums">${a.project_count} 项目 · ${a.session_count} 会话 · ${fmt(a.total_size)}${orphanBulk}</div></div>`));
+      <div class="nums">${a.project_count} 项目 · ${a.session_count} 会话 · ${fmt(a.total_size)}${orphanBulk}${multicaBulk}</div></div>`));
     if(a.note) sec.appendChild(el(`<div class="note">⚠️ ${esc(a.note)}</div>`));
     if(!a.projects.length){ sec.appendChild(el(`<div class="empty">暂无会话</div>`)); box.appendChild(sec); return; }
     const pad=el(`<div class="pad"></div>`);
@@ -227,6 +237,9 @@ function renderSections(){
       const ob=sec.querySelector('[data-act="orphan-bulk"]');
       if(ob) ob.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation();
         doBulkOrphanClean(a.key, ob); });
+      const mb=sec.querySelector('[data-act="multica-bulk"]');
+      if(mb) mb.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation();
+        doBulkMulticaClean(a.key, mb); });
     }
   });
 }
@@ -235,12 +248,18 @@ function projectEl(a, pi){
   const p=a.projects[pi];
   const det=el(`<details class="proj"></details>`);
   const orphan = p.orphan? `<span class="badge orphan">⚠ 工作目录已删除</span>`:"";
+  const hasMultica = p.sessions.some(s=>s.extra&&s.extra.multica);
+  const multicaBadge = hasMultica
+    ? (p.multica_status === "active"
+      ? `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`
+      : "")
+    : "";
   const delBtn = (CFG&&CFG.enabled)
     ? `<button class="del proj" data-act="proj">删除整个项目</button>` : "";
   const sum=el(`<summary class="prow">
      <span class="caret">▶</span>
      <span class="plabel" title="${esc(p.label)}">${esc(p.label)}</span>
-     ${orphan}
+     ${orphan}${multicaBadge}
      <span class="pmeta">${p.session_count} 会话 · ${fmt(p.size)}</span>
      ${delBtn}</summary>`);
   det.appendChild(sum);
@@ -259,6 +278,7 @@ function sessionEl(a, pi, si){
   let tags="";
   if(x.source) tags+=`<span class="tag">${esc(x.source)}</span>`;
   if(x.archived) tags+=`<span class="tag">已归档</span>`;
+  if(x.multica && x.multica.status==="active") tags+= `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`;
   const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
   const row=el(`<div class="srow">
     <span class="stitle"><span class="id">${esc(s.id.slice(0,12))}</span>${tags}${esc(s.title)}</span>
@@ -272,11 +292,20 @@ function sessionEl(a, pi, si){
 
 async function doDelete(agent, scope, projectId, sessionId, label, hasDb, btn){
   if(!CFG||!CFG.enabled) return;
+  const proj = DATA.agents.find(x=>x.key===agent)?.projects.find(p=>p.id===projectId);
+  const isMultica = proj?.sessions?.some(s=>s.extra?.multica);
+  let bodyExtra = "";
+  if(isMultica && scope==="project"){
+    const ms = proj?.multica_status;
+    bodyExtra = ms === "active"
+      ? "\n⚠ 任务可能仍在进行中，将同时清理 Multica 工作区目录和 CLI 缓存（不建议清理）。"
+      : "\n将同时清理 Multica 工作区目录和 CLI 缓存。";
+  }
   if(!await modalConfirm({
     title: scope==="project" ? "🗑 删除整个项目？" : "🗑 删除该会话？",
     body: `<span class="${hasDb?"warn":"soft"}">${esc(label)}</span>\n${hasDb
       ? "⚠ Codex 会话删除不可逆：数据库行、jsonl 索引、相关文件一并永久删除（不进废纸篓）。"
-      : "将移到废纸篓（可逆）。"}`,
+      : "将移到废纸篓（可逆）。"}${bodyExtra}`,
     confirmText: "删除", danger: hasDb,
   })) return;
   btn.disabled=true; btn.textContent="处理中…";
@@ -323,6 +352,34 @@ async function doBulkOrphanClean(agent, btn){
     }catch(e){ fail++; toast(`${orphanIds[i]}: ${e.message}`,true); }
   }
   toast(`孤儿清理完成：成功 ${ok} 项${fail?` / 失败 ${fail} 项`:""}（共 ${totalFiles} 个文件/目录）`);
+  render();
+}
+
+async function doBulkMulticaClean(agent, btn){
+  if(!CFG||!CFG.enabled) return;
+  const a = DATA.agents.find(x=>x.key===agent); if(!a) return;
+  const multicaIds = a.projects.filter(p=>p.multica_status==="cleanable" && !p.orphan).map(p=>p.id);
+  if(!multicaIds.length) return;
+  if(!await modalConfirm({
+    title: `🧹 一键清理 ${multicaIds.length} 个 Multica 可清理会话？`,
+    body: `将清理 <b>${multicaIds.length}</b> 个 Multica 任务，包括 Claude 会话、工作区目录和 CLI 缓存。\n将移到废纸篓（可逆）。`,
+    confirmText: "开始清理", danger: false,
+  })) return;
+  btn.disabled=true;
+  let ok=0, fail=0, totalFiles=0;
+  for(let i=0; i<multicaIds.length; i++){
+    btn.textContent = `清理中 ${i+1}/${multicaIds.length}…`;
+    try{
+      const res=await fetch(CFG.endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({token:CFG.token,agent,scope:"project",project_id:multicaIds[i],session_id:null,mode:"trash"})});
+      const j=await res.json();
+      if(j.ok){
+        applyDelete(agent,"project",multicaIds[i],null);
+        ok++; totalFiles += (j.removed?j.removed.length:0);
+      } else { fail++; toast(`${multicaIds[i]}: ${j.error||"失败"}`,true); }
+    }catch(e){ fail++; toast(`${multicaIds[i]}: ${e.message}`,true); }
+  }
+  toast(`Multica 清理完成：成功 ${ok} 项${fail?` / 失败 ${fail} 项`:""}（共 ${totalFiles} 个文件/目录）`);
   render();
 }
 

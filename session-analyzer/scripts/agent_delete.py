@@ -128,7 +128,7 @@ def prune_roots() -> dict:
     return {
         "claude": [cl / "projects", cl / "session-env", cl / "file-history", cl / "tasks"],
         "antigravity": [ag / "brain", ag / "conversations", ag / "annotations"],
-        "codex": [cx / "sessions", cx / "generated_images"],
+        "codex": [cx / "sessions", cx / "generated_images", HOME / "Documents" / "Codex"],
     }
 
 
@@ -139,18 +139,22 @@ def _dir_empty(d: Path) -> bool:
         return False
 
 
-def prune_empty_dirs(roots, mode: str, removed: list, keep_names=None) -> None:
+def prune_empty_dirs(roots, mode: str, removed: list, keep_names=None, keep_paths=None) -> None:
     """自底向上清掉 roots 下的空目录（含只剩 .DS_Store 的），删到 root 为止，不删 root。
     keep_names 里的目录名即使为空也保留——护住活跃会话的卫星目录（session-env/
-    file-history/tasks 下以活跃 sid 命名的目录）和 Claude 的 memory 持久目录。否则空目录
-    清理会无差别地把活跃会话恰好为空的卫星目录一并收掉，绕过 _claude_live_sids() 保护。"""
+    file-history/tasks 下以活跃 sid 命名的目录）。否则空目录清理会无差别地把活跃会话恰好为空
+    的卫星目录一并收掉，绕过 _claude_live_sids() 保护。
+    keep_paths 是按「绝对路径」精确保护的目录（即使为空也保留）——用于护住「仍有会话的项目」
+    里的 memory 持久目录；已无会话的项目壳里的孤立 memory 不在此列，可随空目录一并回收，
+    否则空 memory 会把整个项目壳永久焊在磁盘上。"""
     keep = keep_names or set()
+    keep_p = {str(Path(p)) for p in (keep_paths or ())}
     for root in roots:
         if not root.is_dir():
             continue
         for cur, _d, _f in os.walk(root, topdown=False):  # 先到最深层，删完叶子父目录可能也空
             p = Path(cur)
-            if p != root and p.name not in keep and _dir_empty(p):
+            if p != root and p.name not in keep and str(p) not in keep_p and _dir_empty(p):
                 try:
                     remove_path(p, mode, removed)
                 except Exception:
@@ -168,9 +172,24 @@ def _claude_live_sids() -> set:
             for f in pdir.glob("*.jsonl"):
                 live.add(f.stem)
             for f in pdir.iterdir():
-                if f.is_dir():
+                # 只认 uuid 形态的会话卫星子目录；像 memory/ 这类非会话目录不算 live sid，
+                # 否则它会被当成「活跃会话」混进 keep，反过来把已无会话的项目壳永久护住。
+                if f.is_dir() and _UUID_RE.match(f.name):
                     live.add(f.name)
     return live
+
+
+def _claude_live_memory_dirs() -> set:
+    """projects 下「仍有会话(≥1 jsonl)」的项目目录里的 memory 子目录——这些是活跃会话的
+    持久 memory，即使为空也按路径精确保护。已无会话的项目壳里的孤立 memory 不在此列：
+    它们会随空目录回收一并清掉，连带把空了的项目壳也收走。返回绝对路径字符串集合。"""
+    proj = HOME / ".claude" / "projects"
+    keep = set()
+    if proj.is_dir():
+        for pdir in proj.iterdir():
+            if pdir.is_dir() and any(pdir.glob("*.jsonl")):
+                keep.add(str(pdir / "memory"))
+    return keep
 
 
 def prune_claude_satellites(mode: str, removed: list) -> list:
@@ -256,7 +275,8 @@ def delete_claude_sessions(project_dirname: str, sids: list, mode: str) -> dict:
     history_rows = _rewrite_jsonl(root / "history.jsonl", set(sids), ("sessionId",))
     # 收尾：删完后 projects/<dir>（及 session-env 等）里空了的目录一并收掉——逐会话删
     # 到最后一个时目录就空了，这正是空目录残留的根因，不再依赖调用方传 remove_empty_dir。
-    prune_empty_dirs(prune_roots()["claude"], mode, removed, _claude_live_sids() | {"memory"})
+    prune_empty_dirs(prune_roots()["claude"], mode, removed,
+                     _claude_live_sids(), _claude_live_memory_dirs())
     return {"removed": removed, "history_rows": history_rows, "errors": errors}
 
 
@@ -268,6 +288,28 @@ def delete_claude_orphan_dir(project_dirname: str, mode: str) -> dict:
     except Exception as e:
         errors.append(str(e))
     return {"removed": removed, "errors": errors}
+
+
+def delete_claude_multica_sessions(project_dirname: str, sids: list, mode: str,
+                                    workspace_path: str | None = None,
+                                    cache_path: str | None = None) -> dict:
+    """Delete Claude sessions backed by Multica tasks.
+    In addition to normal Claude session cleanup, also removes:
+    - The Multica workspace task directory
+    - The Claude CLI Node.js cache directory
+    """
+    result = delete_claude_sessions(project_dirname, sids, mode)
+    for label, path_str in [("workspace", workspace_path), ("cache", cache_path)]:
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if not p.exists():
+            continue
+        try:
+            remove_path(p, mode, result["removed"])
+        except Exception as e:
+            result["errors"].append(f"{p}: {e}")
+    return result
 
 
 # ─────────────────────────── Antigravity ───────────────────────────
@@ -362,6 +404,11 @@ def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
         if snaps.exists():
             for p in snaps.glob(f"{tid}.*.sh"):
                 _safe_remove(p, file_mode, removed, errors)
+        # sessions/YYYY/MM/DD/rollout-*-<tid>.jsonl — session log copies
+        sess_dir = root / "sessions"
+        if sess_dir.exists():
+            for p in sess_dir.rglob(f"rollout-*-{tid}.jsonl"):
+                _safe_remove(p, file_mode, removed, errors)
         ws = _projectless_workspace(t["cwd"], docs_codex, non_target_cwds)
         if ws and str(ws) not in planned_workspaces:
             planned_workspaces.add(str(ws))
@@ -396,7 +443,42 @@ def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
     # 收尾：删 rollout 后 sessions/YYYY/MM/DD 可能空，generated_images/<tid> 也已整删——
     # 自底向上收掉空日期目录（codex 文件级软删无意义，空目录同样硬删，与上文一致）。
     prune_empty_dirs(prune_roots()["codex"], file_mode, removed)
+    # Clean stale project entries from config.toml (paths that no longer exist)
+    # TODO: re-enable once the broken regex/body in _clean_codex_stale_config is finished.
+    # _clean_codex_stale_config(root, removed, errors)
     return {"removed": removed, "errors": errors, "db_rows": db_rows}
+
+
+def _clean_codex_stale_config(root: Path, removed: list, errors: list) -> None:
+    """Remove [projects."..."] sections from config.toml whose paths no longer exist.
+
+    Only removes the section header and its immediate key=value lines.
+    Preserves all other config content (model, mcp_servers, plugins, etc).
+    """
+    # TODO: implement — current body is incomplete (unterminated regex literal).
+    return
+
+
+def _projectless_workspace(cwd: str, docs_codex: Path, non_target_cwds: set) -> Path | None:
+    if not cwd:
+        return None
+    p = Path(cwd).expanduser()
+    try:
+        resolved = p.resolve()
+        rel = resolved.relative_to(docs_codex)
+    except (ValueError, OSError):
+        return None
+    if str(resolved) in non_target_cwds:
+        return None
+    if not rel.parts or not p.is_dir():
+        return None
+    return p
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
 
 
 def _safe_remove(path: Path, mode: str, removed: list, errors: list) -> None:

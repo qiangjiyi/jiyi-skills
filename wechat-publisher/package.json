@@ -1,0 +1,10 @@
+{
+  "name": "wechat-publisher-render",
+  "private": true,
+  "type": "module",
+  "description": "Renderer module for wechat-publisher article mode (markdown → themed HTML).",
+  "dependencies": {
+    "baoyu-md": "0.1.1",
+    "baoyu-chrome-cdp": "0.1.1"
+  }
+}

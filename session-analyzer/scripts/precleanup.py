@@ -25,8 +25,9 @@ def main() -> int:
 
     removed: list = []
     all_roots = [r for rs in ad.prune_roots().values() for r in rs]
-    keep = ad._claude_live_sids() | {"memory"}  # 活跃会话卫星目录 + 持久记忆，空也不清
-    ad.prune_empty_dirs(all_roots, mode, removed, keep)
+    keep = ad._claude_live_sids()  # 活跃会话卫星目录，空也不清
+    keep_paths = ad._claude_live_memory_dirs()  # 仅护「仍有会话」项目的 memory，孤立壳可回收
+    ad.prune_empty_dirs(all_roots, mode, removed, keep, keep_paths)
     orphans = ad.prune_claude_satellites(mode, removed)
     stale_state = ad.prune_claude_session_state(mode, removed)
 

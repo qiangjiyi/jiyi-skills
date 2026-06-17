@@ -9,6 +9,8 @@ build/
 tmp/
 *.log
 .venv/
+__pycache__/
+*.pyc
 
 # 任意层级的 docs 目录一律不开源
 docs/
@@ -17,3 +19,6 @@ docs/
 /baowen-engine/
 /codex-archived-thread-cleaner/
 /commit-push/
+
+# wechat-publisher: lock 文件不入库
+/wechat-publisher/package-lock.json

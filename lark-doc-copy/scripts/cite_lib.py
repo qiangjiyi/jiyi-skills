@@ -154,14 +154,18 @@ def extract_doc_references(xml: str, self_token: str) -> List[Dict]:
         if attrs.get("type") != "doc":
             continue
         ft = attrs.get("file-type")
-        if ft and ft not in ("docx", "doc"):  # 内嵌 sheet/bitable 等，不是文档引用
+        # 只排除真正的内嵌数据对象（sheet/bitable/mindnote 等），
+        # docx/doc/wiki 都是合法的文档引用，必须处理。
+        EMBED_TYPES = {"sheet", "sheets", "bitable", "mindnote", "file", "slides"}
+        if ft in EMBED_TYPES:
             continue
         token = attrs.get("doc-id")
         if not token or token == self_token:
             continue
+        dt = "wiki" if ft == "wiki" else "docx"
         refs.setdefault(token, {
             "raw_token": token,
-            "doc_type": "docx",
+            "doc_type": dt,
             "host": None,
             "url": None,
         })

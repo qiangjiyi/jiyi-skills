@@ -8,8 +8,9 @@
 3. 上传图片到新文档末尾
 4. 移动图片到正确位置
 5. 修复图片显示尺寸（scale）
-6. 修复有序列表的 seq
-7. 合并连续 blockquote
+6. 还原并排图 grid + 迁移画板（whiteboard）
+7. 修复有序列表的 seq
+8. 合并连续 blockquote
 
 输入参数：
   （自动从 state.json 读取）
@@ -18,6 +19,7 @@
   - state.json: 更新所有映射和移动后的状态
 """
 
+import json
 import os
 import re
 import sys
@@ -1199,6 +1201,141 @@ def rebuild_grids(state: Dict) -> int:
     return success
 
 
+def _whiteboard_anchor(src_blocks: List[Dict], i: int, mapping: Dict[str, str]):
+    """为 src_blocks[i]（whiteboard）找新文档里的插入锚点 block id。
+
+    向前找最近的「已映射顶级块」：跳过空 p、img、whiteboard、grid（grid 不保留）；
+    前驱是 ol/ul 时容器 id 不稳定，改用其末项已映射的 li 作锚点。找不到返回 None。
+    """
+    for j in range(i - 1, -1, -1):
+        blk = src_blocks[j]
+        if blk["depth"] != 0:
+            continue
+        if blk["tag"] in ("img", "whiteboard", "grid"):
+            continue
+        if blk["tag"] == "p" and not blk["all_text"]:
+            continue
+        if blk["tag"] in ("ol", "ul"):
+            last_li = None
+            for k in range(j + 1, len(src_blocks)):
+                if src_blocks[k]["depth"] == 0:
+                    break
+                sid = src_blocks[k]["id"]
+                if src_blocks[k]["tag"] == "li" and sid and mapping.get(sid):
+                    last_li = mapping[sid]
+            if last_li:
+                return last_li
+            continue
+        if blk["id"] and mapping.get(blk["id"]):
+            return mapping[blk["id"]]
+    return None
+
+
+def migrate_whiteboards(state: Dict, mapping: Dict[str, str]) -> int:
+    """第 7.7 步：迁移源文档画板（whiteboard）。
+
+    画板是 token 对象，`docs +create` 无法从跨租户 token 重建，会被静默丢弃。
+    本步骤逐个还原（与图片迁移同思路）：
+      1. 读源画板 raw 节点（`whiteboard +query --output_as raw`）
+      2. 在对应锚点后插入空白画板块（`<whiteboard type="blank">`），拿 block_token
+      3. 用 raw 覆盖写入（`whiteboard +update --input_format raw --overwrite`）
+    **必须用 raw 而非 mermaid**：raw 保留原始坐标/尺寸/样式/连接器，布局逐字节一致；
+    mermaid 会让飞书重新自动布局，丢掉原版排布。
+    源画板无读取权限（跨租户禁读）时跳过该画板并告警。
+    """
+    print_step("第 7.7 步：迁移画板（whiteboard）")
+
+    new_doc_id = state["new_doc_id"]
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    src_blocks = xml_to_blocks(source_xml)
+
+    boards = []
+    for i, b in enumerate(src_blocks):
+        if b["tag"] != "whiteboard" or not b.get("id"):
+            continue
+        m = re.search(
+            rf'<whiteboard\b[^>]*?id="{re.escape(b["id"])}"[^>]*?>', source_xml
+        )
+        tok = None
+        if m:
+            tm = re.search(r'\stoken="([^"]+)"', m.group(0))
+            if tm:
+                tok = tm.group(1)
+        if not tok:
+            continue
+        boards.append({"src_token": tok, "anchor_new_id": _whiteboard_anchor(src_blocks, i, mapping)})
+
+    if not boards:
+        print_progress("源文档无画板，跳过")
+        return 0
+
+    print_progress(f"源文档画板: {len(boards)} 个")
+
+    output_dir = Path(state.get("output_dir", "."))
+    success = 0
+    # 反向插入：同一 anchor 多个画板时 block_insert_after 会反序，反向遍历抵消
+    for bd in reversed(boards):
+        tok = bd["src_token"]
+        anchor = bd["anchor_new_id"]
+        if not anchor:
+            print_progress(f"  ✗ 画板 {tok[:12]} 找不到锚点，跳过")
+            continue
+
+        # 1) 读源画板 raw 节点
+        q = run_lark_cli_json([
+            "whiteboard", "+query",
+            "--whiteboard-token", tok,
+            "--output_as", "raw",
+        ], timeout=120)
+        nodes = (q or {}).get("data", {}).get("nodes") if q and q.get("ok") else None
+        if not nodes:
+            print_progress(f"  ✗ 画板 {tok[:12]} raw 读取失败（无权限/跨租户），跳过")
+            continue
+        payload_path = output_dir / f"_wb_{tok[:12]}.json"
+        with open(payload_path, "w", encoding="utf-8") as f:
+            json.dump({"nodes": nodes}, f, ensure_ascii=False)
+
+        # 2) 在锚点后插入空白画板，拿 block_token
+        ins = run_lark_cli_json([
+            "docs", "+update", "--api-version", "v2",
+            "--doc", new_doc_id,
+            "--command", "block_insert_after",
+            "--block-id", anchor,
+            "--content", '<whiteboard type="blank"></whiteboard>',
+            "--doc-format", "xml",
+        ], timeout=60)
+        new_token = None
+        if ins and ins.get("ok"):
+            for nb in ins.get("data", {}).get("document", {}).get("new_blocks", []):
+                if nb.get("block_type") == "whiteboard":
+                    new_token = nb.get("block_token")
+                    break
+        if not new_token:
+            print_progress(f"  ✗ 画板 {tok[:12]} 空白块创建失败，跳过")
+            payload_path.unlink(missing_ok=True)
+            continue
+
+        # 3) raw 覆盖写入（idempotent-token 需 ≥10 字符）
+        upd = run_lark_cli_json([
+            "whiteboard", "+update",
+            "--whiteboard-token", new_token,
+            "--input_format", "raw",
+            "--overwrite",
+            "--idempotent-token", f"wb{new_token[:14]}",
+            "--source", f"@{payload_path.name}",
+        ], timeout=120)
+        payload_path.unlink(missing_ok=True)
+        if upd and upd.get("ok"):
+            success += 1
+            print_progress(f"  ✓ 画板 {tok[:12]} 已还原（raw 保布局）")
+        else:
+            print_progress(f"  ⚠ 画板 {tok[:12]} 空白块已插入但 raw 写入失败，请人工补救")
+
+    print_progress(f"画板迁移成功: {success}/{len(boards)}")
+    return success
+
+
 def strip_blockquote_bg(state: Dict) -> int:
     """
     第 9.5 步：去除引用块（blockquote）文字的归一化灰色背景
@@ -1279,6 +1416,9 @@ def main():
 
     # 第 7.6 步：还原并排图 grid 布局
     rebuild_grids(state)
+
+    # 第 7.7 步：迁移画板（whiteboard）
+    migrate_whiteboards(state, mapping)
 
     # 第 8 步：修复 seq
     fix_list_seq(state, mapping)

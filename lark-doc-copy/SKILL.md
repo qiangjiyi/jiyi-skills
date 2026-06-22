@@ -43,7 +43,7 @@ bash scripts/run_all.sh "https://xxx.feishu.cn/docx/<token>"
 | **0.5** | **`scripts/00_try_native.py`** | **优先尝试原生 `drive files copy` 复制主文档**（保真最高、最快、无扒取 bug）；成功则 `run_all.sh` 跳过 1/2/3，失败退回扒取重建 |
 | 1+2 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 |
 | 3+4 | `scripts/02_create_doc.py` | （兜底）创建新文档（默认根目录，可 `--target-dir-token` 指定） |
-| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、还原 grid、seq、合并 blockquote、去引用块灰底） |
+| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、还原 grid、迁移画板、seq、合并 blockquote、去引用块灰底） |
 | 9.5 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（探测权限 → 优先原生复制 → 兜底递归扒取 → 重指向 cite/链接） |
 | 10+11 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + grid 还原核验 + cite 引用核验（原生复制模式下只核验 cite） |
 | 12 | `scripts/05_cleanup.py` | 清理临时文件 |
@@ -107,6 +107,8 @@ python3 scripts/05_cleanup.py
 第 7.5 步：修复图片显示尺寸（scale）← 重点
   ↓
 第 7.6 步：还原并排图 grid 布局
+  ↓
+第 7.7 步：迁移画板（whiteboard）← 读 raw 节点重建，保留原布局
   ↓
 第 8 步：修复有序列表的 seq ← 重点
   ↓
@@ -226,6 +228,17 @@ python3 scripts/05_cleanup.py
 只处理「每列含一张图」的 grid；width-ratio 会被飞书归一化（趋于等宽，小差异）。`clean_xml` 的空 grid 删除已泛化到任意列数。`04_verify.py` 的 `verify_grids` 核验源/新图 grid 数量是否一致。
 
 详见 `references/api-limitations.md` 限制 16
+
+### 6.6. 画板（whiteboard）丢失（已自动还原）
+
+**问题**：源文档里的 `<whiteboard token="...">` 是 token 对象，`docs +create` 无法从跨租户 token 重建，会被**静默丢弃**——连标题下的占位都不留（实测：「第一次使用路径」章节的流程图画板整块消失）。
+
+**已自动处理**：第 7.7 步 `migrate_whiteboards`（在 `rebuild_grids` 之后）自动还原，思路与图片迁移一致：
+1. `whiteboard +query --output_as raw` 读源画板 **raw 节点**
+2. 在对应锚点（最近的已映射顶级前驱块）后 `block_insert_after` 插入空白画板 `<whiteboard type="blank">`，拿 `block_token`
+3. `whiteboard +update --input_format raw --overwrite` 把 raw 节点覆盖写入
+
+**关键：必须用 raw 而非 mermaid**。raw 保留原始坐标/尺寸/样式/连接器，布局逐字节一致；mermaid（`--output_as code`）会让飞书重新自动布局，丢掉原版排布（如从「两行换行 + 回环连接器」退化成「一条直线」）。`02` `clean_xml` 已剥离 whiteboard 标签防止 create 留残骸；`04` `verify_whiteboards` 核验源/新画板数量。源画板跨租户无读取权限（raw 读不到）时跳过并告警。
 
 ### 7. str_replace 限制
 
@@ -366,6 +379,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | ol/ul 无 block ID、block_replace 后 ID 变化 | 全程靠文本匹配 + 每步重新 fetch | 关键经验 5 / api-limitations 6、7 |
 | 图片 scale/width/height 不保留（scale 默认全尺寸；media-insert 偶发把原生宽高写成占位 100×100） | `03` `fix_image_sizes`（还原 width/height/scale 三者） | 关键经验 1.1 / api-limitations 15 |
 | grid 并排图布局丢失（变竖排） | `03` `rebuild_grids`（移图入新建 grid 列）+ 原生 API 还原列宽；`04` `verify_grids` 核验 | 关键经验 6.5 / api-limitations 16 |
+| 画板（whiteboard）被 create 静默丢弃 | `02` `clean_xml` 剥离 whiteboard；`03` `migrate_whiteboards`（读源 raw 节点 → 建空白板 → raw 覆盖写入，**raw 保布局**）；`04` `verify_whiteboards` 核验 | 关键经验 6.6 |
 | 连续堆叠图第二张及之后定位丢失（漂到无关章节） | `03` `is_anchorable_top` 跳过 img，同组图共用上游文本 anchor | api-limitations 17 |
 | 图片下载/上传瞬时失败导致静默漏图 | `lib.download_image` + `03` `upload_images` 均加重试；`04` `verify_images` 兜底核验数量 | api-limitations 18 |
 | cite `str_replace` 改属性不生效 | `process_cites.py` 改用 `block_replace` 整块重指向 | 多层级 cite 引用递归处理 |
@@ -390,7 +404,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | `scripts/00_try_native.py` | 优先原生复制主文档（`drive files copy`）；成功则跳过 01/02/03 | lib.py, cite_lib.py |
 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 | lib.py, preflight.sh |
 | `scripts/02_create_doc.py` | 创建新文档（默认根目录） | lib.py, 01_fetch_source.py |
-| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
+| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + 还原 grid + 迁移画板 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（复制 + 递归 + 重指向） | lib.py, cite_lib.py, 03_post_process.py |
 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + 重复 li 检测 + cite 引用核验 | lib.py, process_cites.py |
 | `scripts/05_cleanup.py` | 清理临时文件（含 registry 与 `_cite_*` 工作目录） | lib.py |

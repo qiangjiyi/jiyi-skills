@@ -377,6 +377,29 @@ def verify_grids(state: dict) -> dict:
     return {"src_img_grids": src_img_grids, "new_img_grids": new_img_grids, "missing": missing}
 
 
+def verify_whiteboards(state: dict) -> dict:
+    """第 10.65 步：画板（whiteboard）迁移核验。
+
+    源画板会被 create 静默丢弃，由 migrate_whiteboards 读 raw 节点重建。这里对比
+    源文档与新文档的画板数量；缺失通常是源画板跨租户无读取权限（raw 读不到）。
+    """
+    print_step("第 10.65 步：画板迁移核验")
+
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    new_xml = fetch_doc_xml(state["new_doc_id"]) or ""
+
+    src_wb = len(re.findall(r"<whiteboard\b", source_xml))
+    new_wb = len(re.findall(r"<whiteboard\b", new_xml))
+    missing = max(0, src_wb - new_wb)
+
+    print_progress(f"源画板: {src_wb} / 新文档画板: {new_wb}")
+    if missing:
+        print_progress(f"⚠ 有 {missing} 个画板未还原（多为源画板跨租户无读取权限）")
+
+    return {"src_whiteboards": src_wb, "new_whiteboards": new_wb, "missing": missing}
+
+
 def verify_cites(state):
     """第 10.7 步：被引用文档（cite 递归）核验。
 
@@ -447,6 +470,7 @@ def main():
     ol_result = verify_ol_separation(state)
     dup_result = verify_duplicate_li(state)
     grid_result = verify_grids(state)
+    wb_result = verify_whiteboards(state)
     cite_result = verify_cites(state)
 
     results = {
@@ -455,6 +479,7 @@ def main():
         "ol_separation": ol_result,
         "duplicate_li": dup_result,
         "grids": grid_result,
+        "whiteboards": wb_result,
         "cites": cite_result,
     }
 
@@ -502,6 +527,14 @@ def main():
         print("  ✅ 并排图 grid 全部还原")
     else:
         print(f"  ⚠ {grid_missing} 个并排图 grid 未还原（限制 16），请检查 rebuild_grids")
+
+    wb_missing = wb_result.get("missing", 0)
+    if wb_result.get("src_whiteboards", 0) == 0:
+        pass
+    elif wb_missing == 0:
+        print(f"  ✅ 画板全部还原（{wb_result.get('new_whiteboards', 0)} 个，raw 保布局）")
+    else:
+        print(f"  ⚠ {wb_missing} 个画板未还原（多为源画板跨租户无读取权限）")
 
     cite_total = cite_result.get("total", 0)
     if cite_total == 0:

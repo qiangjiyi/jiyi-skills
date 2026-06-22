@@ -32,7 +32,7 @@ from lib import (
 
 
 def clean_xml(content: str) -> str:
-    """清理 XML：去除 block ID、图片标签、空 grid 容器"""
+    """清理 XML：去除 block ID、图片标签、画板标签、空 grid 容器"""
     # 去除 block ID
     content = re.sub(r'\s+id="[^"]*"', '', content)
     # 去除 seq-level 属性
@@ -81,6 +81,13 @@ def clean_xml(content: str) -> str:
 
     # 去除 img 标签（图片单独处理）
     content = re.sub(r'<img[^>]*?/>', '', content)
+    # 去除 whiteboard 标签（画板单独处理）：画板是 token 对象，docs +create 无法从
+    # 跨租户 token 重建，会被静默丢弃（连标题下的占位都不留）。改由 03 的
+    # migrate_whiteboards 读源画板 raw 节点、在对应锚点后重建，保留原始布局。
+    content = re.sub(r'<whiteboard\b[^>]*?/>', '', content)
+    content = re.sub(
+        r'<whiteboard\b[^>]*?>.*?</whiteboard>', '', content, flags=re.DOTALL
+    )
     # 去除空 grid 容器（删 img 后 grid 里只剩空 column）。支持任意列数，
     # 否则 3 列及以上的并排图 grid 删图后会残留空 grid，且会和 rebuild_grids
     # 重建的 grid 重复。grid 的并排布局由第 7.6 步 rebuild_grids 重新还原。
@@ -142,7 +149,7 @@ def main():
         "--content", f"@{cleaned_path.name}",
     ]
     if target_token:
-        create_args.extend(["--folder-token", target_token])
+        create_args.extend(["--parent-token", target_token])
 
     result = run_lark_cli_json(create_args, timeout=120)
 

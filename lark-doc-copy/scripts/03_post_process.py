@@ -1418,6 +1418,92 @@ def rebuild_grids(state: Dict) -> int:
     return success
 
 
+def _get_all_api_blocks(new_doc_id: str) -> List[Dict]:
+    """用飞书 docx blocks API 全量分页拉取新文档块。"""
+    blocks: List[Dict] = []
+    pt = None
+    while True:
+        params = {"page_size": 500}
+        if pt:
+            params["page_token"] = pt
+        r = run_lark_cli_json([
+            "api", "GET",
+            f"/open-apis/docx/v1/documents/{new_doc_id}/blocks",
+            "--params", json.dumps(params),
+        ], timeout=120)
+        if not r or not r.get("ok"):
+            break
+        data = r.get("data", {})
+        blocks.extend(data.get("items", []))
+        pt = data.get("page_token")
+        if not data.get("has_more"):
+            break
+    return blocks
+
+
+def fix_callout_imgs(state: Dict) -> int:
+    """第 7.85 步：修复 callout 边界被破坏导致的图片被错误纳入。
+
+    根因：`02_create_doc.py` 的 `clean_xml` 解析源 XML 时，飞书 docx 的 callout
+    元素（含 emoji、backcolor、bordercolor 等扩展属性）边界识别不完整——`</callout>`
+    在重建时被忽略，导致 callout 之外的 img 被错误吸进 callout children。视觉
+    上 callout 边框会包住本应在外的图，且后续空 p 也错位（实测：OpenClaw 指南
+    「产品使用教程」段后的 XpaLbjFBMo0Q 教程大图被 callout 吞掉、callout 后
+    缺空 p 隔开）。
+
+    修法：用飞书 docx blocks API 列出新文档所有 callout 块，扫描其 children，
+    把 `block_type=27`（img）的 child 用 `block_move_after` 移出到 callout 之后
+    —— 飞书 API 用 callout id 作 anchor 时会把 src 移到 callout 之外、成为
+    顶级 block（parent=doc root）。同时在 callout 之后插入 1 个空 p，避免图紧贴
+    callout 边框。
+    """
+    print_step("第 7.85 步：修复 callout 边界（移出错误纳入的图）")
+
+    new_doc_id = state["new_doc_id"]
+    blocks = _get_all_api_blocks(new_doc_id)
+    by_id = {b.get("block_id"): b for b in blocks}
+    moved = 0
+    inserted = 0
+    for b in blocks:
+        if not b.get("callout"):
+            continue
+        cal_id = b.get("block_id")
+        # 找出 callout children 里的 img
+        img_children = []
+        for ch in b.get("children", []) or []:
+            cb = by_id.get(ch)
+            if cb and cb.get("image") and cb.get("block_type") == 27:
+                img_children.append((ch, cb["image"].get("name", "")))
+        for img_id, name in img_children:
+            r = run_lark_cli_json([
+                "docs", "+update", "--api-version", "v2", "--doc", new_doc_id,
+                "--command", "block_move_after",
+                "--block-id", cal_id,
+                "--src-block-ids", img_id,
+            ], timeout=60)
+            if r and r.get("ok"):
+                moved += 1
+                print_progress(f"  ✓ 移出 img {name[:24]} 自 callout {cal_id[:14]}")
+            else:
+                print_progress(f"  ⚠ 移出 img {img_id[:14]} 失败: {(r or {}).get('msg') or 'unknown'}")
+        if img_children:
+            # callout 后补 1 个空 p（避免图紧贴 callout 边框）
+            # 重要：用 callout id 作 anchor，block_insert_after 把它插到 callout 之后
+            r = run_lark_cli_json([
+                "docs", "+update", "--api-version", "v2", "--doc", new_doc_id,
+                "--command", "block_insert_after",
+                "--block-id", cal_id,
+                "--content", "<p></p>",
+                "--doc-format", "xml",
+            ], timeout=60)
+            if r and r.get("ok"):
+                inserted += 1
+                print_progress(f"  ✓ callout {cal_id[:14]} 之后插入空 p")
+    print_progress(f"callout 边界修复: 移出 {moved} 张图, 插入 {inserted} 个空 p")
+    update_state(callout_fixed={"moved": moved, "inserted": inserted})
+    return moved
+
+
 def _preceding_mapped_anchor(src_blocks: List[Dict], i: int, mapping: Dict[str, str]):
     """为 src_blocks[i]（whiteboard / sheet 等需重建的对象）找新文档里的插入锚点。
 
@@ -1994,6 +2080,10 @@ def main():
 
     # 第 7.6 步：还原并排图 grid 布局
     rebuild_grids(state)
+
+    # 第 7.85 步：修复 callout 边界（move_nested_images / rebuild_grids 可能
+    # 让图被错误吸进 callout children）
+    fix_callout_imgs(state)
 
     # 第 7.65 步：校准图片前后空 p 数量（move_nested_images 没继承 blank_gap）
     normalize_image_empty_p_around(state)

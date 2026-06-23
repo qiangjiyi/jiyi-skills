@@ -43,7 +43,7 @@ bash scripts/run_all.sh "https://xxx.feishu.cn/docx/<token>"
 | **0.5** | **`scripts/00_try_native.py`** | **优先尝试原生 `drive files copy` 复制主文档**（保真最高、最快、无扒取 bug）；成功则 `run_all.sh` 跳过 1/2/3，失败退回扒取重建 |
 | 1+2 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 |
 | 3+4 | `scripts/02_create_doc.py` | （兜底）创建新文档（默认根目录，可 `--target-dir-token` 指定） |
-| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、嵌套图、对齐、还原 grid、校准空 p、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
+| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、嵌套图、对齐、还原 grid、修复 callout、校准空 p、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
 | 9.5 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（探测权限 → 优先原生复制 → 兜底递归扒取 → 重指向 cite/链接） |
 | 10+11 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + grid 还原核验 + cite 引用核验（原生复制模式下只核验 cite） |
 | 12 | `scripts/05_cleanup.py` | 清理临时文件 |
@@ -111,6 +111,8 @@ python3 scripts/05_cleanup.py
 第 7.55 步：还原图片对齐（左/右）← 原生 API replace_image
   ↓
 第 7.6 步：还原并排图 grid 布局
+  ↓
+第 7.85 步：修复 callout 边界（移出错误纳入的图）
   ↓
 第 7.65 步：校准图片前后空 p 数量 ← 源/新逐图比对 (before, after)，互换案例挪空 p
   ↓
@@ -231,6 +233,14 @@ python3 scripts/05_cleanup.py
 **操作空 p 后必验证**（2026-06-23 踩坑）：`block_insert_after` / `block_move_after` / `block_delete` 操作空 p 后**立即用 `_count_around_empty_p` 验证**前后图的位置数是否匹配预期——block_move_after 在 src 是空 p、anchor 紧跟空 p 时可能把空 p 落到错位置（多/少 1 个空 p）；不要假设"插 1 个 + 删 1 个 = 净 0"，必须用诊断确认。
 
 **关键陷阱（2026-06-23 实测）**：Python `xml.etree.Element` **没有 `__bool__` 重载**，所有 Element 都视为 falsy（无论有没有子节点）！写 `if anchor_e and ep_e` 永远 False，必须 `if anchor_e is not None and ep_e is not None`。**所有 ElementTree 处理代码都用 `is not None` 替代 truthy check**。
+
+### 1.5 callout 边界 parse 错误
+
+**问题**：`02_create_doc.py` 的 `clean_xml` 解析源 XML 时，飞书 docx 的 callout 元素（含 emoji、backcolor、bordercolor 等扩展属性）边界识别不完整——`</callout>` 在重建时被忽略，导致 callout **之外**的 img 被错误吸进 callout children。视觉上 callout 边框包住本应在外的图，且后续空 p 错位（实测：OpenClaw 指南「产品使用教程」段后的 XpaLbjFBMo0Q 教程大图被 callout 吞掉、callout 后缺空 p 隔开）。
+
+**修复**：第 7.85 步 `fix_callout_imgs`（在 `rebuild_grids` 之后、`normalize_image_empty_p_around` 之前）：用飞书 docx blocks API 列出新文档所有 callout 块，扫描其 children，把 `block_type=27`（img）的 child 用 `block_move_after` 移出到 callout 之后——飞书 API 用 callout id 作 anchor 时会把 src 移到 callout 之外、成为顶级 block（parent=doc root）。同时在 callout 之后插入 1 个空 p，避免图紧贴 callout 边框。
+
+**核验**：第 10.7 步 `verify_callout` 扫所有 callout，若 children 里有 img 则报 ❌ 提示人工修（`fix_callout_imgs` 失败时回退到人工）。
 
 ### 2. 有序列表序号
 
@@ -449,6 +459,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | grid 并排图布局丢失（变竖排） | `03` `rebuild_grids`（移图入新建 grid 列）+ 原生 API 还原列宽；`04` `verify_grids` 核验 | 关键经验 6.5 / api-limitations 16 |
 | 画板（whiteboard）被 create 静默丢弃 | `02` `clean_xml` 剥离 whiteboard；`03` `migrate_whiteboards`（读源 raw 节点 → 建空白板 → raw 覆盖写入，**raw 保布局**）；`04` `verify_whiteboards` 核验 | 关键经验 6.6 |
 | `move_nested_images` 不继承 blank_gap → 图前/图后空 p 互换 | `03` `normalize_image_empty_p_around`（源/新逐图比对 (before, after)，互换案例挪空 p）；`04` `verify_image_blank_p` 诊断 | 关键经验 1.4 |
+| callout 边界 parse 错误 → 外层图被吸进 callout children | `03` `fix_callout_imgs`（API 扫 callout children，把 img 用 `block_move_after` 移出到 callout 之后；callout 后补 1 空 p）；`04` `verify_callout` 诊断 | 关键经验 1.5 |
 | 同步块（synced-source）/ 内嵌表格（sheet）被 create 静默丢弃 | `02` `clean_xml` 解包同步块、剥离 sheet；`03` `migrate_sheets`（读单元格渲染成原生 table）；`04` `verify_embedded` 核验 | 关键经验 6.7 |
 | 连续堆叠图第二张及之后定位丢失（漂到无关章节） | `03` `is_anchorable_top` 跳过 img，同组图共用上游文本 anchor | api-limitations 17 |
 | 折叠标题/段落内的嵌套图片对 `xml_to_blocks` 不可见 → 不被锚定、堆文末 | `03` `move_nested_images`（ElementTree 全量扁平化找嵌套图 + 文本锚点重定位）；`04` 文末堆积图核验 | 关键经验 1.3 |
@@ -475,7 +486,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | `scripts/00_try_native.py` | 优先原生复制主文档（`drive files copy`）；成功则跳过 01/02/03 | lib.py, cite_lib.py |
 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 | lib.py, preflight.sh |
 | `scripts/02_create_doc.py` | 创建新文档（默认根目录） | lib.py, 01_fetch_source.py |
-| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + 还原 grid + 校准空 p + 迁移画板/内嵌表格 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
+| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + 还原 grid + 修复 callout + 校准空 p + 迁移画板/内嵌表格 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（复制 + 递归 + 重指向） | lib.py, cite_lib.py, 03_post_process.py |
 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + 重复 li 检测 + cite 引用核验 | lib.py, process_cites.py |
 | `scripts/05_cleanup.py` | 清理临时文件（含 registry 与 `_cite_*` 工作目录） | lib.py |

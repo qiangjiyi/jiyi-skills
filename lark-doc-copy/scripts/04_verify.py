@@ -17,6 +17,7 @@
 
 import re
 import sys
+import json
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -29,6 +30,7 @@ from lib import (
     load_state,
     print_progress,
     print_step,
+    run_lark_cli_json,
     update_state,
     xml_to_blocks,
 )
@@ -514,6 +516,48 @@ def verify_image_blank_p(state: dict) -> dict:
     }
 
 
+def verify_callout(state: dict) -> dict:
+    """第 10.7 步：核验 callout 内不含 img（应是 0；非 0 说明 clean_xml 边界破坏）。
+
+    `fix_callout_imgs`（03 第 7.85 步）会把错误吸进 callout 的 img 移到 callout 之外。
+    本函数在最后做一次核验：扫所有 callout，若 children 里有 img 则报 ❌ 提示人工修。
+    """
+    print_step("第 10.7 步：callout 边界核验")
+
+    new_doc_id = state["new_doc_id"]
+    blocks = []
+    pt = None
+    while True:
+        params = {"page_size": 500}
+        if pt:
+            params["page_token"] = pt
+        r = run_lark_cli_json([
+            "api", "GET",
+            f"/open-apis/docx/v1/documents/{new_doc_id}/blocks",
+            "--params", json.dumps(params),
+        ], timeout=120)
+        if not r or not r.get("ok"):
+            break
+        data = r.get("data", {})
+        blocks.extend(data.get("items", []))
+        pt = data.get("page_token")
+        if not data.get("has_more"):
+            break
+    by_id = {b.get("block_id"): b for b in blocks}
+    bad = []
+    for b in blocks:
+        if not b.get("callout"):
+            continue
+        for ch in b.get("children", []) or []:
+            cb = by_id.get(ch)
+            if cb and cb.get("image") and cb.get("block_type") == 27:
+                bad.append((b.get("block_id"), ch, cb["image"].get("name", "")))
+    print_progress(f"callout 内含 img 的坏 case: {len(bad)}")
+    for cal, child, name in bad[:5]:
+        print_progress(f"  ⚠ callout {cal[:14]} 含 img {child[:14]} name={name[:30]}")
+    return {"bad_count": len(bad), "bad": bad}
+
+
 def verify_embedded(state: dict) -> dict:
     """第 10.66 步：内嵌对象（同步块 + 内嵌表格）迁移核验。
 
@@ -629,6 +673,7 @@ def main():
     grid_result = verify_grids(state)
     wb_result = verify_whiteboards(state)
     blank_p_result = verify_image_blank_p(state)
+    callout_result = verify_callout(state)
     embed_result = verify_embedded(state)
     cite_result = verify_cites(state)
 
@@ -691,6 +736,11 @@ def main():
             print(f"  ✅ 图片前后空 p 全部对齐（{blank_p_result['common']} 张）")
     else:
         print(f"  ⚠ 图片空 p 分布异常 {bp_total} 张: " + ", ".join(f"{k}={v}" for k, v in bp.items()) + "（normalize_image_empty_p_around 应已修 swapped/front_lost/back_lost）")
+
+    if callout_result.get("bad_count", 0) == 0:
+        print("  ✅ callout 边界完整（callout 内不含外层 img）")
+    else:
+        print(f"  ⚠ {callout_result['bad_count']} 个 callout 内含 img（fix_callout_imgs 失败，需人工）")
 
     grid_missing = grid_result.get("missing", 0)
     if grid_result.get("src_img_grids", 0) == 0:

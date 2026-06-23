@@ -211,15 +211,24 @@ python3 scripts/05_cleanup.py
 
 ### 1.4 图片前后空 <p> 数量校准
 
-**问题**：`move_nested_images` 把嵌套在折叠标题里的图用 `block_move_after(前驱文本块, img)` 移到位，**没有继承** `move_images` 的 `blank_gap` + `_nth_empty_p_after` 机制（见关键经验 1 的「图前空行保留」段）。结果：原本夹在 anchor 与图之间的「图前空 p」被 `block_move_after` 反吸到图后，**空 p 分布互换**——源 `(图前 1, 图后 0)` → 新 `(图前 0, 图后 1)`。实测：OpenClaw 指南「附：阿里云百炼」h4 标题上方多出 1 个空行（其实是 HS1Gb 图前空 p 被搬到了图后）。
+**问题**：`move_nested_images` 把嵌套在折叠标题里的图用 `block_move_after(前驱文本块, img)` 移到位，**没有继承** `move_images` 的 `blank_gap` + `_nth_empty_p_after` 机制（见关键经验 1 的「图前空行保留」段）。结果：原本夹在 anchor 与图之间的「图前空 p」被 `block_move_after` 反吸到图后，**空 p 分布错位**。实测：OpenClaw 指南「附：阿里云百炼」h4 标题上方多出 1 个空行（其实是 HS1Gb 图前空 p 被搬到了图后）。
 
-**修复**：第 7.65 步 `normalize_image_empty_p_around`（在 `rebuild_grids` 之后）源/新逐图比对 `(before, after)`，自动修正三类常见 case：
-- **swap** `(B_s, A_s) == (A_n, B_n)`（最常见）：从图后挪一个空 p 到图前（`block_move_after(前驱文本块, 空p)` → `block_move_after(空p, img)`）。
-- **front_lost** `B_s > B_n, A_s == A_n`：把图后一个空 p 挪到图前。
-- **back_lost** `A_s > A_n, B_s == B_n`：把图前一个空 p 挪到图后。
-- **other**（复杂 case）：记日志，留给人工。
+**4 类 case 与修法**（每行 `(图前, 图后)`）：
+
+| 案例 | 源 | 修前 | 修法 | 修后 |
+|---|---|---|---|---|
+| **swap**（最常见，互换）| (1, 0) | (0, 1) | `block_move_after(前驱文本块, 图后空p)` → `block_move_after(空p, img)` | (1, 0) |
+| **front_lost**（图前少）| (1, 1) | (0, 2) | 找图后空 p 移到图前 | (1, 1) |
+| **back_lost**（图后少）| (1, 1) | (1, 0) | 找图前空 p 移到图后 | (1, 1) |
+| **other**（复杂）| 各种 | 各种 | 留人工，记日志 | — |
+
+**front_lost 和 back_lost 是对称关系**：都是某侧少 1 个空 p、另一侧多 1 个。区别是"哪侧是对的"——前驱文本块决定图前是否应有空 p（通常有，源文档靠空行隔开图和段），后继文本块决定图后。
+
+**修复**：第 7.65 步 `normalize_image_empty_p_around`（在 `rebuild_grids` 之后）源/新逐图比对 `(before, after)`，自动修正三类常见 case。
 
 **核验**：`04_verify` 的 `verify_image_blank_p` 列出源/新每张图 (before, after) 分布，按 `swapped/front_lost/back_lost/other` 分类报告。
+
+**操作空 p 后必验证**（2026-06-23 踩坑）：`block_insert_after` / `block_move_after` / `block_delete` 操作空 p 后**立即用 `_count_around_empty_p` 验证**前后图的位置数是否匹配预期——block_move_after 在 src 是空 p、anchor 紧跟空 p 时可能把空 p 落到错位置（多/少 1 个空 p）；不要假设"插 1 个 + 删 1 个 = 净 0"，必须用诊断确认。
 
 **关键陷阱（2026-06-23 实测）**：Python `xml.etree.Element` **没有 `__bool__` 重载**，所有 Element 都视为 falsy（无论有没有子节点）！写 `if anchor_e and ep_e` 永远 False，必须 `if anchor_e is not None and ep_e is not None`。**所有 ElementTree 处理代码都用 `is not None` 替代 truthy check**。
 
@@ -473,3 +482,21 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | `scripts/run_all.sh` | 一键执行入口（`<url> [folder-token]`，按顺序调用上面所有） | 全部 |
 | `scripts/lib.py` | 共享工具库（被其他脚本导入） | lark-cli |
 | `scripts/cite_lib.py` | cite 递归处理库（registry/提取/探测/复制/递归/重指向） | lib.py, lark-cli |
+
+---
+
+## 调试教训 & 已知陷阱
+
+排查/修改时反复踩到的坑，跨具体修复通用：
+
+### Element.__bool__ quirk（最高频踩坑）
+
+Python `xml.etree.Element` **没有 `__bool__` 重载**——所有 Element 都被视为 falsy（无论有没有子节点）。`if element:` 永远 False，`element and other_thing` 永远是 `other_thing` 的真假。
+
+**正确**：`if element is not None` 或 `if element is not None and element.get("id"):`。
+
+任何处理飞书 XML 的代码（`normalize_image_empty_p_around`、`move_nested_images`、未来新增的 element 处理函数）都用 `is not None` 替代 truthy check。
+
+### 操作空 p 必验证（2026-06-23 案例）
+
+`block_insert_after` / `block_move_after` / `block_delete` 操作空 p 后**立即用 `_count_around_empty_p` 验证**——block_move_after 在 src 是空 p、anchor 紧跟空 p 时可能把空 p 落到错位置（多/少 1 个空 p）。**不要假设"插 1 + 删 1 = 净 0"**——跑诊断确认。

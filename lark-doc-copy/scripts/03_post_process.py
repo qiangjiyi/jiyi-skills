@@ -287,7 +287,11 @@ def compute_image_anchors(state: Dict, mapping: Dict[str, str]) -> List[Dict]:
         # pre（代码块）也是可直接锚定的顶级文本块：源文档常见「代码块 → 截图」，
         # 若不含 pre，图片前驱是代码块时会落入 fallback、无锚点、卡在文末
         # （实测 bug：OpenClaw 指南 9 张紧跟代码块的截图全部漂到文末）。
-        MAPPABLE_TOP = ("p", "h1", "h2", "h3", "callout", "blockquote", "pre")
+        # 注：h1-h3 不在列表——`compute_image_anchors` 看到的是 xml_to_blocks 解析
+        # 的顶级块，顶级 heading 不会成为图的直接前驱（前驱一定是 p/callout/
+        # blockquote/pre/li/img）。xml_to_blocks 不递归进 heading，嵌套标题里的
+        # 图由 `move_nested_images`（第 7.05 步）单独处理。
+        MAPPABLE_TOP = ("p", "callout", "blockquote", "pre")
 
         # 空 <p>（分隔空行）在文本映射里没有 key，也不是有意义的锚点；
         # 找前驱/后继时一律跳过，否则会得到 anchor_new_id=None（实测：3 张图

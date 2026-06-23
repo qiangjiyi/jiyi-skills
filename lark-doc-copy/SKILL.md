@@ -43,7 +43,7 @@ bash scripts/run_all.sh "https://xxx.feishu.cn/docx/<token>"
 | **0.5** | **`scripts/00_try_native.py`** | **优先尝试原生 `drive files copy` 复制主文档**（保真最高、最快、无扒取 bug）；成功则 `run_all.sh` 跳过 1/2/3，失败退回扒取重建 |
 | 1+2 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 |
 | 3+4 | `scripts/02_create_doc.py` | （兜底）创建新文档（默认根目录，可 `--target-dir-token` 指定） |
-| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、对齐、还原 grid、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
+| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、嵌套图、对齐、还原 grid、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
 | 9.5 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（探测权限 → 优先原生复制 → 兜底递归扒取 → 重指向 cite/链接） |
 | 10+11 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + grid 还原核验 + cite 引用核验（原生复制模式下只核验 cite） |
 | 12 | `scripts/05_cleanup.py` | 清理临时文件 |
@@ -103,6 +103,8 @@ python3 scripts/05_cleanup.py
 第 6 步：上传图片到新文档末尾
   ↓
 第 7 步：移动图片到正确位置 ← 重点
+  ↓
+第 7.05 步：移动嵌套图片（折叠标题/段落内）← ElementTree 全量扁平化补救
   ↓
 第 7.5 步：修复图片显示尺寸（scale）← 重点
   ↓
@@ -190,6 +192,20 @@ python3 scripts/05_cleanup.py
 **两个坑**：
 - XML `block_replace`（fix_image_sizes 改 scale 用）会**清掉 align** → `fix_image_align` 必须在 `fix_image_sizes` **之后**跑。
 - `replace_image` 不带 `scale` 会把 **scale 重置成 1** → 调用时把新图当前 `width/height/scale` 一并传入，align 和 scale 都不丢（`replace_image` 接受 `token/width/height/align/scale`）。
+
+### 1.3 折叠标题/段落内的嵌套图片
+
+**问题**：飞书「**折叠标题**」(可折叠 heading) 会把其下整段内容作为**子块嵌套进 heading 元素**（XML 里是 `<h2>…<h3/><p/><img/>…</h2>`）。`lib.xml_to_blocks` 只递归进 `callout/blockquote/ol/ul/grid/column`，**不递归进 heading/p**，所以嵌套其中的图片对 `compute_image_anchors` **完全不可见**——从不被锚定、上传后全堆在文末（实测：OpenClaw 指南「内置 API 模型」等章节 21 张图丢位）。同理嵌套在 `<p>` 里的内联图也会漏。
+
+**修复**：第 7.05 步 `move_nested_images`（在 `move_images` 之后）用 **ElementTree 全量扁平化**补救：
+1. 扁平化源文档（递归进所有标签），找出 `xml_to_blocks` 漏掉的图片（祖先链含非递归容器）
+2. 每张图取「最近的前驱可锚文本块」(p/h/callout/pre/blockquote/li 含文字) 作锚点
+3. 在新文档（同样全量扁平化，能看到折叠标题内子块及其 id）里按 (tag, 文本) 定位锚点 block id
+4. `block_move_after` 把图（已上传在文末）移到锚点后；同锚点多图按**反向源序**
+
+**核验**：`04_verify` 的 `verify_image_positions` 用 ElementTree 数「文末堆积图片数」源/新对比，多出即有图卡在文末（嵌套图没移走）。
+
+> 为什么不直接让 `xml_to_blocks` 递归进 heading：那会牵动 `build_id_mapping`/`fix_list_seq`/所有核验，且 `compute_image_anchors` 的三模式锚点逻辑都假设 anchor 是 depth-0 顶级块；改动面大、风险高。`move_nested_images` 作为独立补救步骤，只处理「漏网的嵌套图」，不碰已调好的主路径。
 
 ### 2. 有序列表序号
 
@@ -409,6 +425,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | 画板（whiteboard）被 create 静默丢弃 | `02` `clean_xml` 剥离 whiteboard；`03` `migrate_whiteboards`（读源 raw 节点 → 建空白板 → raw 覆盖写入，**raw 保布局**）；`04` `verify_whiteboards` 核验 | 关键经验 6.6 |
 | 同步块（synced-source）/ 内嵌表格（sheet）被 create 静默丢弃 | `02` `clean_xml` 解包同步块、剥离 sheet；`03` `migrate_sheets`（读单元格渲染成原生 table）；`04` `verify_embedded` 核验 | 关键经验 6.7 |
 | 连续堆叠图第二张及之后定位丢失（漂到无关章节） | `03` `is_anchorable_top` 跳过 img，同组图共用上游文本 anchor | api-limitations 17 |
+| 折叠标题/段落内的嵌套图片对 `xml_to_blocks` 不可见 → 不被锚定、堆文末 | `03` `move_nested_images`（ElementTree 全量扁平化找嵌套图 + 文本锚点重定位）；`04` 文末堆积图核验 | 关键经验 1.3 |
 | 图片下载/上传瞬时失败导致静默漏图 | `lib.download_image` + `03` `upload_images` 均加重试；`04` `verify_images` 兜底核验数量 | api-limitations 18 |
 | cite `str_replace` 改属性不生效 | `process_cites.py` 改用 `block_replace` 整块重指向 | 多层级 cite 引用递归处理 |
 | 跨租户 / 禁止复制时原生 `drive files copy` 失败 | `process_cites.py` 兜底递归 `run_all.sh` 扒取 | 多层级 cite 引用递归处理 |

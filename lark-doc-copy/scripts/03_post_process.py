@@ -505,6 +505,127 @@ def move_images(state: Dict, image_anchors: List[Dict]) -> int:
     return success
 
 
+# xml_to_blocks 会递归进入的容器（其余标签——尤其 h1-h9 折叠标题、p、table——
+# 不递归，嵌套其中的图片对 compute_image_anchors 不可见）
+_XTB_CONTAINERS = ("callout", "blockquote", "ol", "ul", "grid", "column")
+_NESTED_ANCHOR_TAGS = ("p", "h1", "h2", "h3", "h4", "h5", "h6",
+                       "callout", "pre", "blockquote", "li")
+
+
+def _et_flatten(xml: str):
+    """用 ElementTree 按文档顺序扁平化（递归进所有容器），返回 (元素列表, 父映射)。"""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(f"<root>{xml}</root>")
+    flat, parent = [], {}
+    def walk(e):
+        for c in e:
+            flat.append(c)
+            parent[c] = e
+            walk(c)
+    walk(root)
+    return flat, parent, root
+
+
+def move_nested_images(state: Dict, mapping: Dict[str, str]) -> int:
+    """第 7.05 步：移动嵌套在折叠标题/段落里的图片。
+
+    飞书「折叠标题」(可折叠 heading) 把其下整段内容作为**子块嵌套进 heading 元素**，
+    `xml_to_blocks` 不递归进 heading/p，导致这些嵌套图片对 `compute_image_anchors`
+    不可见、从不被移动、全堆在文末（实测：OpenClaw 指南「内置 API 模型」等 21 张
+    嵌套图丢位）。本步骤用 ElementTree 全量扁平化补救：
+      1. 扁平化源文档，找出 `xml_to_blocks` 漏掉的嵌套图片（祖先链含非递归容器）
+      2. 每张图取「最近的前驱可锚文本块」(p/h/callout/pre/blockquote/li 含文字) 作锚点
+      3. 在新文档(同样全量扁平化, 含折叠标题内子块)里按 (tag, 文本) 定位锚点 block id
+      4. `block_move_after` 把图(已上传在文末)移到锚点后；同锚点多图按反向源序
+    """
+    print_step("第 7.05 步：移动嵌套图片（折叠标题/段落内）")
+
+    new_doc_id = state["new_doc_id"]
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+
+    sflat, sparent, _ = _et_flatten(source_xml)
+
+    def is_visible(el):
+        """xml_to_blocks 能否看到该元素：祖先链只能由可递归容器组成。"""
+        e = sparent.get(el)
+        while e is not None and e.tag != "root":
+            if e.tag not in _XTB_CONTAINERS:
+                return False
+            e = sparent.get(e)
+        return True
+
+    # 收集嵌套图片（src token + 源文档顺序 + 锚点文本）
+    nested = []  # (token, order_idx, anchor_tag, anchor_text)
+    for i, el in enumerate(sflat):
+        if el.tag != "img":
+            continue
+        tok = el.get("src")
+        if not tok or is_visible(el):
+            continue
+        anchor = None
+        for j in range(i - 1, -1, -1):
+            pe = sflat[j]
+            if pe.tag in _NESTED_ANCHOR_TAGS:
+                t = "".join(pe.itertext()).strip()
+                if t:
+                    anchor = (pe.tag, t)
+                    break
+        if anchor:
+            nested.append((tok, i, anchor[0], anchor[1]))
+
+    if not nested:
+        print_progress("无嵌套图片，跳过")
+        return 0
+    print_progress(f"发现嵌套图片: {len(nested)} 张")
+
+    # 新文档全量扁平化：(tag, 文本) -> [block id]，并按 name 定位图片块当前 id
+    new_xml = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
+    nflat, _, _ = _et_flatten(new_xml)
+    text2id = defaultdict(list)
+    img_name2id = {}
+    for el in nflat:
+        if el.tag in _NESTED_ANCHOR_TAGS and el.get("id"):
+            t = "".join(el.itertext()).strip()
+            if t:
+                text2id[(el.tag, t)].append(el.get("id"))
+        elif el.tag == "img" and el.get("id"):
+            nm = el.get("name", "")
+            if nm.endswith((".png", ".jpg")):
+                nm = nm[:-4]
+            img_name2id[nm] = el.get("id")
+
+    def find_anchor_id(tag, text):
+        ids = text2id.get((tag, text))
+        if ids:
+            return ids[0]
+        for (tg, tx), v in text2id.items():
+            if tx == text:
+                return v[0]
+        return None
+
+    def mv(anchor, src):
+        r = run_lark_cli_json([
+            "docs", "+update", "--api-version", "v2", "--doc", new_doc_id,
+            "--command", "block_move_after", "--block-id", anchor,
+            "--src-block-ids", src,
+        ], timeout=60)
+        return bool(r and r.get("ok"))
+
+    # 反向源序移动：同锚点多图最终保持正序
+    success = 0
+    for tok, _, atag, atext in sorted(nested, key=lambda x: x[1], reverse=True):
+        img_id = img_name2id.get(tok)
+        anchor_id = find_anchor_id(atag, atext)
+        if img_id and anchor_id and mv(anchor_id, img_id):
+            success += 1
+        else:
+            print_progress(f"  ⚠ 嵌套图 {tok[:12]} 移动失败（img={bool(img_id)} anchor={bool(anchor_id)}）")
+
+    print_progress(f"嵌套图片移动成功: {success}/{len(nested)}")
+    return success
+
+
 def fix_image_sizes(state: Dict) -> int:
     """
     第 7.5 步：修复图片显示尺寸（scale + width + height）
@@ -1616,6 +1737,9 @@ def main():
     # 第 7 步：移动图片
     image_anchors = compute_image_anchors(state, mapping)
     move_images(state, image_anchors)
+
+    # 第 7.05 步：移动嵌套在折叠标题/段落里的图片（xml_to_blocks 不可见）
+    move_nested_images(state, mapping)
 
     # 第 7.5 步：修复图片显示尺寸（scale）
     fix_image_sizes(state)

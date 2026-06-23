@@ -204,11 +204,37 @@ def verify_image_positions(state: dict) -> dict:
             print_progress(f"    src: prev={m['src_prev'][:50]}, next={m['src_next'][:50]}")
             print_progress(f"    new: prev={m['new_prev'][:50]}, next={m['new_next'][:50]}")
 
+    # 文末堆积图片核验：嵌套在折叠标题里的图若没被 move_nested_images 移走，会全
+    # 堆在文末。xml_to_blocks 看不到嵌套图，故用 ElementTree 全量扁平化数「最后一个
+    # 文本块之后的图片数」，源/新对比，多出即有图卡在文末（limitations 19）。
+    def _trailing_imgs(xml: str) -> int:
+        import xml.etree.ElementTree as ET
+        flat = []
+        def w(e):
+            for c in e:
+                flat.append(c); w(c)
+        try:
+            w(ET.fromstring(f"<root>{xml}</root>"))
+        except Exception:
+            return -1
+        last_text = -1
+        for k, e in enumerate(flat):
+            if e.tag != "img" and "".join(e.itertext()).strip():
+                last_text = k
+        return sum(1 for e in flat[last_text + 1:] if e.tag == "img")
+
+    src_trail = _trailing_imgs(source_xml)
+    new_trail = _trailing_imgs(new_xml)
+    trailing_stuck = max(0, new_trail - src_trail) if src_trail >= 0 and new_trail >= 0 else 0
+    print_progress(f"文末堆积图片: 源 {src_trail} / 新 {new_trail}"
+                   + (f"  ⚠ 疑似卡住 {trailing_stuck} 张" if trailing_stuck else ""))
+
     return {
         "image_count_src": len(src_imgs),
         "image_count_new": len(new_imgs),
         "mismatch_count": len(mismatches),
         "mismatches": mismatches,
+        "trailing_stuck": trailing_stuck,
     }
 
 
@@ -544,6 +570,9 @@ def main():
         print(f"  ⚠ {image_result['mismatch_count']} 张图片位置需要重新调整")
     else:
         print(f"  ❌ 图片核验失败")
+
+    if image_result.get("trailing_stuck", 0):
+        print(f"  ⚠ {image_result['trailing_stuck']} 张图片卡在文末（多为折叠标题内嵌套图，检查 move_nested_images）")
 
     dup_count = dup_result.get("duplicate_count", -1)
     if dup_count == 0:

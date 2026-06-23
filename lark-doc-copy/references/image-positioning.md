@@ -1,6 +1,6 @@
 # 图片定位详细规范
 
-本文档是 `SKILL.md` 第 7 步「图片移动到正确位置」和第 10 步「图片位置核验」的详细操作规范。
+本文档是图片定位（`03_post_process.py` 的 `compute_image_anchors` / `move_images` / `move_nested_images`）与图片位置核验（`04_verify.py`）的详细操作规范，对应 `SKILL.md` 工作流的「图片定位」环节。
 
 ---
 

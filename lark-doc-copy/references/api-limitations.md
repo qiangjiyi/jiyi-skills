@@ -783,10 +783,12 @@ for j in range(i + 1, min(len(src_blocks), i + 15)):
 ### 当前实现（`rebuild_grids`，第 7.6 步，已自动化）
 
 `03_post_process.py` 的 `rebuild_grids` 在 `fix_image_sizes` 之后运行：
-1. `_parse_source_image_grids` 解析源文档里「每列含一张图」的 grid（含 width-ratio + img src token）。
+1. `_parse_source_image_grids` 解析源文档里「纯图片列」的 grid，返回 `[(width-ratio, [tokens...]), ...]`（**每列可含 1 张或多张图**）。判定纯图片列：列里除 `<img>` 和空 `<p>` 外有正文文字 → 整个 grid 跳过（那是图文混排/文本列 grid，create 能原样保留，误处理会破坏布局）。
 2. 对每个 grid：用 `name="<token>.png"` 在新文档找到对应 img block；anchor 取「第一张图的前一个同级块」（`_preceding_sibling_id`）。
-3. 按上面的「占位 p」三步法插 grid、移图入列、删占位 p。
-4. 幂等：图片已在 `<column>` 内则跳过，不会重复建 grid；每个 grid 处理前重新 fetch（id 会变）。
+3. 「占位 p」三步法：每列插一个占位 `<p>__GScN__</p>`；**列内多图依次首尾相接**——第一张移到占位 p 之后落入列，后续每张移到上一张之后（保持列内上下顺序）；最后删占位 p。
+4. 幂等：首图已在 `<column>` 内则跳过，不会重复建 grid；每个 grid 处理前重新 fetch（id 会变）。
+
+**多图支持（2026-06-23）**：原先只还原「每列 1 图」，碰到 2 列×每列 2 图的 2×2 图墙时只把每列首图放进列、其余图掉到 grid 外变竖排（实测：「共享文件夹」段 4 图墙错位）。现按上面的列内首尾相接逻辑逐列归位。
 
 配套：
 - `clean_xml` 的空 grid 删除已泛化到**任意列数**（`<grid>(<column…></column>)+</grid>`），避免 3 列及以上残留空 grid。
@@ -795,7 +797,8 @@ for j in range(i + 1, min(len(src_blocks), i + 15)):
 ### 已知差异
 
 - **width-ratio**：`block_insert_after` 建 grid 时飞书强制等宽（忽略 XML 里的 width-ratio）。**已修复**：`rebuild_grids` 在图片就位后用原生 API `update_grid_column_width_ratio`（整数百分比，最大余数法凑 100）二次设置列宽，可还原非等宽布局（±1% 舍入）。
-- 只处理「每列恰好一张图」的 grid；含文本列或混合内容的 grid 不自动重建（这类 grid 文本列在 create 时本就能保留）。
+- 支持每列 1 张或多张图（纯图片列）；含**正文文字**的图文混排列/文本列不自动重建（这类 grid 在 create 时本就能保留）。
+- `04_verify.py` 的 `verify_grids` 除核验「grid 数」外，还核验「列内图片总数」——grid 数对上但列内图少了 → 多图列没还原完整，会专门告警。
 
 ---
 
@@ -827,7 +830,77 @@ for j in range(i + 1, min(len(src_blocks), i + 15)):
 
 ### 解决方案（已实现）
 
-`download_image` 和 `upload_images` 的 media-insert 均加**有限次重试**（默认 3 次，下载带退避 + 非空文件校验）。`04_verify.py` 的 `verify_images` 仍核验源/新图片数，作为兜底告警；递归子调用若仍漏图，按本文件「关键经验」手动补：下载该 token → media-insert → block_move_after 到正确锚点 → 设回源 scale。
+`download_image` 和 `upload_images` 的 media-insert 均加**有限次重试**（默认 3 次，下载带退避 + 非空文件校验）。`04_verify.py` 的 `verify_images` 仍核验源/新图片数，作为兜底告警；递归子调用若仍漏图，按以下步骤手动补：下载该 token → media-insert → block_move_after 到正确锚点 → 设回源 scale。
+
+---
+
+## 限制 19：图紧跟顶级标题后 → 无 anchor 漂到文末（**已修复**）
+
+### 现象
+
+源文档常见 `## 标题\n图` 或 `## 标题\n空行\n图`——图紧跟在**顶级 heading** 后、之间无正文段落。复制后这类图全部漂到文档**末尾**（实测：「多账号管理工具」文档「代理服务器」图、「软件登录」标题后首图被甩到文末「下载地址」章节，其余图整体前移补位）。
+
+### 原因
+
+`compute_image_anchors` 找图的「前驱 top-level block」后，按 `pred.tag in MAPPABLE_TOP` 决定走 direct 模式。早期 `MAPPABLE_TOP` 只含 `p/callout/blockquote/pre`、**漏了 heading**（错误假设「顶级 heading 不会成为图的直接前驱」）。于是前驱是 heading 的图匹配不到任何分支 → 落入 fallback 且无 anchor → 留在 media-insert 上传位置（文末）。
+
+### 解决方案（已实现）
+
+`MAPPABLE_TOP` 加入 `h1`–`h9`，这类图走 direct 锚到 heading（`blank_gap` 机制照常保留图前空行）。注意区分：这是**顶级 heading 作前驱**（heading 与图是同级兄弟）；折叠标题内**嵌套**的图（heading 作父容器、图是其 child）是另一回事，由 `move_nested_images` 处理。
+
+---
+
+## 限制 19.1：block_move_after「src 在锚点之前会越位一格」（手动补救必读）
+
+### 现象
+
+手工用 `block_move_after(anchor, src)` 补救顺序时实测：**当 src 当前位置在 anchor 之前**（把一个靠前的块往后挪到 anchor 后面）时，src 不紧贴 anchor，而是落到「anchor 的下一个块」之后（越位一格）。连续几次这种「回挪」会让块一路漂移到无关位置。
+
+### 定性
+
+这是 `block_move_after` 落点不可靠家族的**第三种形态**（前两种见限制 5.3：①anchor 后紧跟空 p；②src 本身是空 p）。共同结论：**block_move_after 落点不可靠，每次调用后必须 fetch 重新核验实际落点，不能假设「紧贴 anchor」。**
+
+### 更稳的手工补救手法（按可靠性排序）
+
+1. **能用 children-create API 就别用 block_move_after**：`POST .../blocks/{parent}/children` 带显式 `index`，落点确定（重建目录组件、补空行都用这个）。空段落不能用 `block_type 2 + 空 elements`（报 `invalid param`），空行改用 `docs +update block_insert_after --content '<p></p>' --doc-format xml`。
+2. **挪顺序优先「正向移动」**：要让 A 在 B 前，与其把 A 往前挪，不如把 B 往 A 后挪（src=B 在 anchor=A 之后，落点更可预期）。
+3. **调空行用「删旧 + 插新」而非移动空 p**（见限制 5.3），锚点尽量选**非容器**块；必须锚 grid 等容器时插完立刻核验，越位了再补正。
+
+---
+
+## 限制 20：文档封面（顶部背景图）丢失（**已自动还原**）
+
+### 现象
+
+飞书文档顶部的背景图是 docx **文档级属性**（`document.cover` = token + offset_ratio），**不在 XML body 里**——`docs +fetch` 取不到、`docs +create` 也不复制，扒取重建后新文档顶部背景图整块消失。原生 `drive files copy` 路径天然保留封面，本问题只出现在扒取重建兜底路径。
+
+### 解决方案（已实现：`migrate_cover`，第 7.9 步）
+
+1. `GET /docx/v1/documents/{id}` 读源 `document.cover`（token + offset_ratio_x/y）。
+2. **跨租户用 `docs +media-preview --token` 下载封面图**——`docs resource-download --type cover` 跨租户 403（与普通图片同坑），必须走 media-preview workaround。
+3. `docs resource-update --type cover --file ... --offset-ratio-x/y` 上传并设为新文档封面，带回原 offset。
+
+`04_verify.py` 的 `verify_cover_and_addons` 对比源/新 `document.cover` 是否都存在。源封面跨租户无读取权限时跳过并告警。
+
+---
+
+## 限制 21：ISV 组件块（目录等 add-ons）丢失（**已自动还原**）
+
+### 现象
+
+飞书「目录」等第三方/扩展组件是 docx **`block_type 40`（add_ons）**，带 `component_type_id` + `record`（如目录组件 `blk_637dcc698597401c1a8fd711`）。`docs +create` 把它们**静默丢弃**——XML 里只剩一个无内容的 `<readonly-block type="isv">`（丢了 component_type_id/record），光看 XML 既不知道是什么组件、也无法重建（实测：「🧭目录」「skill目录」两处目录组件整块消失）。
+
+### 解决方案（已实现：`migrate_addons`，第 7.95 步，须用原生 blocks API）
+
+1. `GET .../blocks` 列出源所有 `block_type 40`，拿每个的 `component_type_id` + `record` + 位置（parent + 前驱同级）。
+2. 锚点 = 最近的**已映射前驱同级块**；新父 = 源父（页面根 → 新文档根，否则走 mapping）。
+3. `POST .../blocks/{parent}/children`，`index` = 锚点在新父 children 中的位置 +1，body 用 `{"block_type":40,"add_ons":{component_type_id, record}}` 重建。
+
+**两个坑**：
+- 必须用原生 children-create API 重建，**不能用 XML `block_insert_after`**（XML 的 `<readonly-block>` 不带 component_type_id/record，飞书重建不出组件）。
+- **同一文档可能有多个同类型组件，但 `record` 各不相同**（实测：两处目录组件一个 `isShowAllLevel:true`、一个 `false`）——必须逐块带各自的 `record`，不能复用第一个。
+
+`04_verify.py` 的 `verify_cover_and_addons` 数源/新 `block_type 40` 数量核验。
 
 ---
 

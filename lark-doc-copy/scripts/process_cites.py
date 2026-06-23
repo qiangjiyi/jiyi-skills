@@ -19,7 +19,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib import fetch_doc_xml, load_state, print_step, update_state, print_progress
+from lib import (
+    fetch_doc_xml,
+    load_state,
+    print_step,
+    update_state,
+    print_progress,
+    run_lark_cli_json,
+)
 from cite_lib import (
     get_depth,
     get_registry_path,
@@ -45,6 +52,14 @@ def _self_token(url: str) -> str:
     return tok
 
 
+def _doc_title(doc_id: str) -> str:
+    """读取 docx 文档真实标题（self 登记用）。失败返回空串。"""
+    r = run_lark_cli_json([
+        "api", "GET", f"/open-apis/docx/v1/documents/{doc_id}",
+    ], timeout=60)
+    return ((r or {}).get("data", {}).get("document", {}) or {}).get("title", "") or ""
+
+
 def main():
     state = load_state()
     new_doc_id = state.get("new_doc_id")
@@ -56,11 +71,18 @@ def main():
     print_progress(f"registry: {get_registry_path()}  depth={get_depth()}")
 
     # 1) 登记 self（防回引死循环）
+    #
+    # 关键：self 登记的 title 必须用文档**真实标题**，不能用通用占位「（主文档）」。
+    # registry 是跨递归层共享、按 token 后写覆盖的。被引用文档 X 若走兜底递归扒取，
+    # 其子进程会以 self 身份把 X 登记进同一 registry；若 title 写死「（主文档）」，
+    # 就会把父进程本应给 X 记录的真实标题污染掉——父进程最终报告里这个引用就显示成
+    # 「（主文档）→ X 副本链接」，既看不出真实标题、又像是把主文档指错（实测：
+    # 主文档引用的「多账号管理工具。」被显示成「（主文档）」）。改为取真实标题即可。
     self_tok = _self_token(state.get("source_url", ""))
     if self_tok:
         register(self_tok, {
             "status": "done", "method": "self",
-            "title": "（主文档）",
+            "title": _doc_title(new_doc_id) or "（主文档）",
             "new_token": new_doc_id,
             "new_url": state.get("new_doc_url"),
             "raw_token": self_tok,

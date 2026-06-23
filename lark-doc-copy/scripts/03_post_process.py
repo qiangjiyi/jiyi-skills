@@ -287,11 +287,15 @@ def compute_image_anchors(state: Dict, mapping: Dict[str, str]) -> List[Dict]:
         # pre（代码块）也是可直接锚定的顶级文本块：源文档常见「代码块 → 截图」，
         # 若不含 pre，图片前驱是代码块时会落入 fallback、无锚点、卡在文末
         # （实测 bug：OpenClaw 指南 9 张紧跟代码块的截图全部漂到文末）。
-        # 注：h1-h3 不在列表——`compute_image_anchors` 看到的是 xml_to_blocks 解析
-        # 的顶级块，顶级 heading 不会成为图的直接前驱（前驱一定是 p/callout/
-        # blockquote/pre/li/img）。xml_to_blocks 不递归进 heading，嵌套标题里的
-        # 图由 `move_nested_images`（第 7.05 步）单独处理。
-        MAPPABLE_TOP = ("p", "callout", "blockquote", "pre")
+        # heading（h1-h9）必须在列表：源文档常见「## 标题\n图」或「## 标题\n空行\n图」
+        # ——图紧跟在**顶级标题**后、之间没有正文段落，此时图的直接前驱就是 heading。
+        # 早期误以为「顶级 heading 不会成为图的直接前驱」把 h 排除在外，导致这类图
+        # 落入 fallback、无 anchor、全部漂到文末（实测 bug：「多账号管理工具」文档
+        # 代理服务器图 E2Nl、软件登录标题后首图 AGk7 被甩到文末「下载地址」章节）。
+        # 注：这里处理的是**顶级 heading 作前驱**；折叠标题内**嵌套**的图（heading
+        # 作父容器、图是其 child）是另一回事，由 `move_nested_images`（第 7.05 步）处理。
+        MAPPABLE_TOP = ("p", "callout", "blockquote", "pre",
+                        "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9")
 
         # 空 <p>（分隔空行）在文本映射里没有 key，也不是有意义的锚点；
         # 找前驱/后继时一律跳过，否则会得到 anchor_new_id=None（实测：3 张图
@@ -1240,12 +1244,14 @@ def _preceding_sibling_id(new_xml: str, target_id: str):
 
 
 def _parse_source_image_grids(source_xml: str) -> List[List[tuple]]:
-    """解析源文档里「每列都含一张图」的 grid，返回每个 grid 的
-    [(width-ratio, img_src_token), ...]（按列顺序）。
+    """解析源文档里「纯图片列」的 grid，返回每个 grid 的
+    [(width-ratio, [img_src_token, ...]), ...]（按列顺序；每列可含 1 张或多张图）。
 
     只处理图片 grid（并排图布局）——这类 grid 在 create 时图片被剥离、空 grid
-    被 clean_xml 删除，导致并排图变竖排，需要 rebuild_grids 还原。文本列 grid
-    在 create 时能保留，不在此列。
+    被 clean_xml 删除，导致并排图变竖排，需要 rebuild_grids 还原。
+    - **每列可含多张图**（如 2 列×每列 2 图的 2×2 图墙）：列内图按出现顺序收集。
+    - 列里除图片（和空 <p>）外**有正文文字 → 整个 grid 跳过**：那是文本列 grid，
+      create 能原样保留，不归本步骤处理（误处理会破坏文本列布局）。
     """
     grids = []
     for g in re.finditer(r"<grid\b[^>]*>(.*?)</grid>", source_xml, re.DOTALL):
@@ -1253,12 +1259,18 @@ def _parse_source_image_grids(source_xml: str) -> List[List[tuple]]:
         items = []
         ok = True
         for attrs, body in cols:
-            img_m = re.search(r'<img\b[^>]*?\bsrc="([^"]+)"', body)
-            if not img_m:
-                ok = False  # 有列不是单图 → 跳过这个 grid（交给人工）
+            tokens = re.findall(r'<img\b[^>]*?\bsrc="([^"]+)"', body)
+            if not tokens:
+                ok = False  # 有列不含图 → 文本列 grid，整体跳过（交给 create 保留）
+                break
+            # 列里除 img 和空 p 外不能有正文文字（有文字 = 图文混排列，跳过）
+            residual = re.sub(r'<img\b[^>]*?/>', '', body)
+            residual = re.sub(r'<p\b[^>]*>\s*</p>', '', residual)
+            if re.sub(r'<[^>]+>', '', residual).strip():
+                ok = False
                 break
             ratio_m = re.search(r'width-ratio="([^"]+)"', attrs)
-            items.append((ratio_m.group(1) if ratio_m else "", img_m.group(1)))
+            items.append((ratio_m.group(1) if ratio_m else "", tokens))
         if ok and len(items) >= 2:
             grids.append(items)
     return grids
@@ -1352,51 +1364,66 @@ def rebuild_grids(state: Dict) -> int:
     ratio_fixed = 0
     for gi, items in enumerate(grids):
         new_xml = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
-        # 用 name="<token>.png" 找新文档里对应的 img block
-        img_ids = []
-        for _ratio, token in items:
-            m = re.search(rf'<img id="([^"]+)" name="{re.escape(token)}\.png"', new_xml)
-            if m:
-                img_ids.append(m.group(1))
-        if len(img_ids) != len(items):
-            print_progress(f"grid#{gi} 图片未全找到（{len(img_ids)}/{len(items)}），跳过")
+        # 用 name="<token>.png" 找新文档里对应的 img block；按列分组保留列内顺序
+        col_img_ids = []  # [[id, id, ...] per column]
+        total_tokens = 0
+        found = 0
+        for _ratio, tokens in items:
+            ids = []
+            for token in tokens:
+                total_tokens += 1
+                m = re.search(rf'<img id="([^"]+)" name="{re.escape(token)}\.png"', new_xml)
+                if m:
+                    ids.append(m.group(1))
+                    found += 1
+            col_img_ids.append(ids)
+        if found != total_tokens:
+            print_progress(f"grid#{gi} 图片未全找到（{found}/{total_tokens}），跳过")
             continue
+        first_img = col_img_ids[0][0]
 
-        # 幂等：图片已在 <column> 内说明该 grid 已还原，跳过（避免重复建 grid）
-        if re.search(rf'<column\b[^>]*>(?:(?!</column>).)*?<img id="{re.escape(img_ids[0])}"',
+        # 幂等：首图已在 <column> 内说明该 grid 已还原，跳过（避免重复建 grid）
+        if re.search(rf'<column\b[^>]*>(?:(?!</column>).)*?<img id="{re.escape(first_img)}"',
                      new_xml, re.DOTALL):
             print_progress(f"grid#{gi} 已还原，跳过")
             continue
 
-        anchor = _preceding_sibling_id(new_xml, img_ids[0])
+        anchor = _preceding_sibling_id(new_xml, first_img)
         if not anchor:
             print_progress(f"grid#{gi} 找不到锚点，跳过")
             continue
 
+        # 每列一个占位 <p>，列内多图依次移到占位 p 之后、再首尾相接
         cols_xml = "".join(
-            f'<column width-ratio="{(r or "0.5")}"><p>__GS{i}__</p></column>'
-            for i, (r, _t) in enumerate(items)
+            f'<column width-ratio="{(r or "0.5")}"><p>__GSc{ci}__</p></column>'
+            for ci, (r, _toks) in enumerate(items)
         )
         ins = upd("block_insert_after", block_id=anchor, content=f"<grid>{cols_xml}</grid>")
         if not (ins and ins.get("ok")):
             print_progress(f"grid#{gi} 插入失败: {(ins or {}).get('error', {}).get('message', '')[:60]}")
             continue
 
-        # 重新 fetch 定位占位 p（在 anchor 之后那段里）
+        # 重新 fetch 定位每列占位 p（在 anchor 之后那段里）
         nx2 = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
         seg = nx2[nx2.find(f'id="{anchor}"'):]
         ph_ids = []
         moved = True
-        for i, img_id in enumerate(img_ids):
-            pm = re.search(rf'<p id="([^"]+)">__GS{i}__</p>', seg)
+        for ci, ids in enumerate(col_img_ids):
+            pm = re.search(rf'<p id="([^"]+)">__GSc{ci}__</p>', seg)
             if not pm:
                 moved = False
                 break
             ph_id = pm.group(1)
             ph_ids.append(ph_id)
-            r = upd("block_move_after", block_id=ph_id, src_block_ids=img_id)
-            if not (r and r.get("ok")):
-                moved = False
+            # 列内多图：第一张移到占位 p 之后落入列，后续每张移到上一张之后
+            col_anchor = ph_id
+            for img_id in ids:
+                r = upd("block_move_after", block_id=col_anchor, src_block_ids=img_id)
+                if not (r and r.get("ok")):
+                    moved = False
+                    break
+                col_anchor = img_id  # 下一张接在这张后面，保持列内顺序
+            if not moved:
                 break
         if ph_ids:
             upd("block_delete", block_id=",".join(ph_ids))
@@ -1405,10 +1432,10 @@ def rebuild_grids(state: Dict) -> int:
             # 图片已就位后，用原生 API 还原非等宽列宽（block_insert_after 会强制等宽）
             nx3 = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
             gm = re.search(
-                rf'<grid id="([^"]+)">(?:(?!</grid>).)*?<img id="{re.escape(img_ids[0])}"',
+                rf'<grid id="([^"]+)">(?:(?!</grid>).)*?<img id="{re.escape(first_img)}"',
                 nx3, re.DOTALL)
             if gm:
-                ratios = [r for r, _t in items]
+                ratios = [r for r, _toks in items]
                 if _set_grid_ratios(new_doc_id, gm.group(1), ratios):
                     ratio_fixed += 1
         else:
@@ -2045,6 +2072,194 @@ def strip_blockquote_bg(state: Dict) -> int:
     return success
 
 
+def migrate_cover(state: Dict) -> bool:
+    """第 7.9 步：迁移文档封面（cover / 顶部背景图）。
+
+    封面是 docx **文档级属性**（`document.cover` = token + offset_ratio），不在 XML
+    body 里，`docs +create` 不复制——扒取重建后新文档顶部背景图丢失。本步骤：
+      1. 读源文档 cover（GET /docx/v1/documents/{id} → cover.token/offset）
+      2. 跨租户用 `+media-preview` 下载封面图（`resource-download` 跨租户 403，
+         与普通图片同坑，走 media-preview workaround）
+      3. `resource-update --type cover` 上传并设为新文档封面，带回原 offset_ratio
+    源无封面则跳过；下载/上传失败仅告警不阻断。
+    （原生 `drive files copy` 路径天然保留封面，本步骤只服务扒取重建兜底路径。）
+    """
+    print_step("第 7.9 步：迁移文档封面（背景图）")
+
+    from cite_lib import _inspect_token  # 复用 wiki→docx 解析
+    src = _inspect_token(state["source_url"])
+    if not src:
+        print_progress("⚠ 无法解析源文档 token，跳过封面迁移")
+        return False
+    src_token = src[0]
+
+    meta = run_lark_cli_json([
+        "api", "GET", f"/open-apis/docx/v1/documents/{src_token}",
+    ], timeout=60)
+    cover = ((meta or {}).get("data", {}).get("document", {}) or {}).get("cover")
+    if not cover or not cover.get("token"):
+        print_progress("源文档无封面，跳过")
+        update_state(cover_migrated=False)
+        return False
+    cover_token = cover["token"]
+    ox = cover.get("offset_ratio_x", 0) or 0
+    oy = cover.get("offset_ratio_y", 0) or 0
+    print_progress(f"源文档封面: {cover_token[:12]} offset=({ox},{oy})")
+
+    output_dir = Path(state.get("output_dir", "."))
+    cover_path = output_dir / "_cover.img"
+    dl = run_lark_cli_json([
+        "docs", "+media-preview",
+        "--token", cover_token,
+        "--output", str(cover_path),
+        "--overwrite",
+    ], timeout=120)
+    if not (dl and dl.get("ok") and cover_path.exists()):
+        print_progress("  ✗ 封面下载失败（跨租户禁读？），跳过")
+        update_state(cover_migrated=False)
+        return False
+
+    new_doc_id = state["new_doc_id"]
+    up = run_lark_cli_json([
+        "docs", "resource-update",
+        "--doc", new_doc_id,
+        "--type", "cover",
+        "--file", str(cover_path),
+        "--offset-ratio-x", str(ox),
+        "--offset-ratio-y", str(oy),
+    ], timeout=120)
+    ok = bool(up and up.get("ok"))
+    print_progress("封面迁移: " + ("✅ 成功" if ok else "✗ 上传失败"))
+    update_state(cover_migrated=ok)
+    return ok
+
+
+def _addons_blocks_from_source(src_token: str) -> List[Dict]:
+    """列出源文档所有 ISV 组件块（block_type 40 add_ons，如「目录」）。
+
+    返回 [{id, parent_id, prev_siblings(由近到远), component_type_id, record}]。
+    add_ons 在 XML 里只渲染成无内容的 `<readonly-block type="isv">`（丢了
+    component_type_id/record），必须走原生 blocks API 才能拿到组件标识与配置。
+    """
+    items = []
+    page_token = None
+    for _ in range(50):
+        params = {"page_size": 500, "document_revision_id": -1}
+        if page_token:
+            params["page_token"] = page_token
+        r = run_lark_cli_json([
+            "api", "GET",
+            f"/open-apis/docx/v1/documents/{src_token}/blocks",
+            "--params", json.dumps(params),
+        ], timeout=120)
+        data = (r or {}).get("data")
+        if not data:
+            break
+        items.extend(data.get("items", []))
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+
+    by_id = {b.get("block_id"): b for b in items}
+    result = []
+    for b in items:
+        if b.get("block_type") != 40:
+            continue
+        bid = b.get("block_id")
+        parent = b.get("parent_id")
+        pblk = by_id.get(parent)
+        children = pblk.get("children", []) if pblk else []
+        prev_siblings = []
+        if bid in children:
+            idx = children.index(bid)
+            prev_siblings = list(reversed(children[:idx]))  # 由近到远
+        ao = b.get("add_ons", {}) or {}
+        result.append({
+            "id": bid,
+            "parent_id": parent,
+            "prev_siblings": prev_siblings,
+            "component_type_id": ao.get("component_type_id"),
+            "record": ao.get("record", "") or "",
+        })
+    return result
+
+
+def migrate_addons(state: Dict, mapping: Dict[str, str]) -> int:
+    """第 7.95 步：迁移 ISV 组件块（目录等 add-ons）。
+
+    飞书「目录」等第三方/扩展组件是 docx `block_type 40`（add_ons，
+    component_type_id + record）。`docs +create` 把它们静默丢弃（XML 里只剩空的
+    `<readonly-block type="isv">`），实测：源文档「🧭目录」下的目录组件整块消失。
+    本步骤用原生 children-create API 在对应位置重建同 component_type_id/record 的
+    add_ons 块：
+      1. 原生 blocks API 列出源所有 block_type 40（拿 component_type_id/record/位置）
+      2. 锚点 = 最近的已映射前驱同级块；新父 = 源父（页面根→新文档根，否则 mapping）
+      3. POST .../blocks/{parent}/children，index = 锚点在新父 children 中的位置+1
+    （原生 `drive files copy` 路径天然保留组件块，本步骤只服务扒取重建兜底路径。）
+    """
+    print_step("第 7.95 步：迁移 ISV 组件块（目录等 add-ons）")
+
+    from cite_lib import _inspect_token
+    src = _inspect_token(state["source_url"])
+    if not src:
+        print_progress("⚠ 无法解析源文档 token，跳过 add-ons 迁移")
+        return 0
+    src_token = src[0]
+
+    addons = _addons_blocks_from_source(src_token)
+    if not addons:
+        print_progress("源文档无 ISV 组件块，跳过")
+        update_state(addons_migrated={"src": 0, "done": 0})
+        return 0
+    print_progress(f"源文档 ISV 组件块: {len(addons)} 个")
+
+    new_doc_id = state["new_doc_id"]
+    success = 0
+    # 反向插入：同一锚点多个组件时按反向源序抵消 children-create 的顺序翻转
+    for ao in reversed(addons):
+        ctid = ao["component_type_id"]
+        if not ctid:
+            continue
+        sp = ao["parent_id"]
+        new_parent = new_doc_id if sp == src_token else mapping.get(sp)
+        if not new_parent:
+            print_progress(f"  ✗ {ctid[:12]} 找不到新父块，跳过")
+            continue
+        # 锚点：最近的已映射前驱同级块
+        new_anchor = None
+        for ps in ao["prev_siblings"]:
+            if mapping.get(ps):
+                new_anchor = mapping[ps]
+                break
+        kids = run_lark_cli_json([
+            "api", "GET",
+            f"/open-apis/docx/v1/documents/{new_doc_id}/blocks/{new_parent}/children",
+            "--params", json.dumps({"page_size": 500, "document_revision_id": -1}),
+        ], timeout=120)
+        child_ids = [c.get("block_id") for c in ((kids or {}).get("data", {}) or {}).get("items", [])]
+        index = child_ids.index(new_anchor) + 1 if (new_anchor and new_anchor in child_ids) else 0
+        body = {
+            "index": index,
+            "children": [{
+                "block_type": 40,
+                "add_ons": {"component_type_id": ctid, "record": ao["record"]},
+            }],
+        }
+        r = run_lark_cli_json([
+            "api", "POST",
+            f"/open-apis/docx/v1/documents/{new_doc_id}/blocks/{new_parent}/children",
+            "--data", json.dumps(body),
+        ], timeout=60)
+        if r and r.get("ok"):
+            success += 1
+        else:
+            print_progress(f"  ✗ {ctid[:12]} 创建失败")
+
+    print_progress(f"ISV 组件迁移: {success}/{len(addons)}")
+    update_state(addons_migrated={"src": len(addons), "done": success})
+    return success
+
+
 def main():
     state = load_state()
     if not state.get("source_url") or not state.get("new_doc_id"):
@@ -2093,6 +2308,12 @@ def main():
 
     # 第 7.8 步：迁移内嵌表格（sheet → 原生 table）
     migrate_sheets(state, mapping)
+
+    # 第 7.9 步：迁移文档封面（顶部背景图，文档级属性）
+    migrate_cover(state)
+
+    # 第 7.95 步：迁移 ISV 组件块（目录等 add-ons）
+    migrate_addons(state, mapping)
 
     # 第 8 步：修复 seq
     fix_list_seq(state, mapping)

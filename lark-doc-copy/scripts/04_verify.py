@@ -383,26 +383,38 @@ def verify_grids(state: dict) -> dict:
         source_xml = f.read()
     new_xml = fetch_doc_xml(state["new_doc_id"]) or ""
 
-    # 源文档「每列含一张图」的 grid 数
+    # 源文档「纯图片列」的 grid：数量 + 列内图片总数（每列可含多图）
     src_img_grids = 0
+    src_grid_imgs = 0
     for g in re.finditer(r"<grid\b[^>]*>(.*?)</grid>", source_xml, re.DOTALL):
         cols = re.findall(r"<column\b[^>]*>(.*?)</column>", g.group(1), re.DOTALL)
         if cols and all(re.search(r"<img\b", c) for c in cols) and len(cols) >= 2:
             src_img_grids += 1
+            src_grid_imgs += sum(len(re.findall(r"<img\b", c)) for c in cols)
 
-    # 新文档里「列内含图」的 grid 数
+    # 新文档里「列内含图」的 grid：数量 + 列内图片总数
     new_img_grids = 0
+    new_grid_imgs = 0
     for g in re.finditer(r"<grid\b[^>]*>(.*?)</grid>", new_xml, re.DOTALL):
         cols = re.findall(r"<column\b[^>]*>(.*?)</column>", g.group(1), re.DOTALL)
         if cols and all(re.search(r"<img\b", c) for c in cols):
             new_img_grids += 1
+            new_grid_imgs += sum(len(re.findall(r"<img\b", c)) for c in cols)
 
     missing = max(0, src_img_grids - new_img_grids)
-    print_progress(f"源并排图 grid: {src_img_grids} / 新文档图 grid: {new_img_grids}")
+    imgs_missing = max(0, src_grid_imgs - new_grid_imgs)
+    print_progress(f"源并排图 grid: {src_img_grids}（含图 {src_grid_imgs}）/ "
+                   f"新文档图 grid: {new_img_grids}（含图 {new_grid_imgs}）")
     if missing:
         print_progress(f"⚠ 有 {missing} 个并排图 grid 未还原，请检查 rebuild_grids 或人工补救")
+    # grid 数对上、但列内图片少了 → 多图列没被完整还原（图掉到 grid 外变竖排）
+    if not missing and imgs_missing:
+        print_progress(f"⚠ grid 数对上但列内少了 {imgs_missing} 张图（多图列未完整还原），"
+                       f"请检查 rebuild_grids 多图逻辑")
 
-    return {"src_img_grids": src_img_grids, "new_img_grids": new_img_grids, "missing": missing}
+    return {"src_img_grids": src_img_grids, "new_img_grids": new_img_grids,
+            "missing": missing, "src_grid_imgs": src_grid_imgs,
+            "new_grid_imgs": new_grid_imgs, "imgs_missing": imgs_missing}
 
 
 def verify_whiteboards(state: dict) -> dict:
@@ -426,6 +438,64 @@ def verify_whiteboards(state: dict) -> dict:
         print_progress(f"⚠ 有 {missing} 个画板未还原（多为源画板跨租户无读取权限）")
 
     return {"src_whiteboards": src_wb, "new_whiteboards": new_wb, "missing": missing}
+
+
+def verify_cover_and_addons(state: dict) -> dict:
+    """第 10.68 步：封面（背景图）+ ISV 组件块（目录等）迁移核验。
+
+    两者都是 `docs +create` 会丢弃的对象，由 migrate_cover / migrate_addons 还原：
+      - 封面：对比源/新 document.cover 是否都存在
+      - ISV 组件：用原生 blocks API 数源/新 block_type 40 数量
+    缺失通常是源对象跨租户无读取权限（封面 media-preview 失败 / blocks 读不到）。
+    """
+    print_step("第 10.68 步：封面 + ISV 组件迁移核验")
+
+    from cite_lib import _inspect_token
+    src = _inspect_token(state["source_url"])
+    new_doc_id = state["new_doc_id"]
+
+    def _doc_cover(doc_id):
+        r = run_lark_cli_json(["api", "GET", f"/open-apis/docx/v1/documents/{doc_id}"], timeout=60)
+        return bool(((r or {}).get("data", {}).get("document", {}) or {}).get("cover"))
+
+    def _count_addons(doc_id):
+        n = 0
+        page_token = None
+        for _ in range(50):
+            params = {"page_size": 500, "document_revision_id": -1}
+            if page_token:
+                params["page_token"] = page_token
+            r = run_lark_cli_json([
+                "api", "GET", f"/open-apis/docx/v1/documents/{doc_id}/blocks",
+                "--params", json.dumps(params),
+            ], timeout=120)
+            data = (r or {}).get("data")
+            if not data:
+                break
+            n += sum(1 for b in data.get("items", []) if b.get("block_type") == 40)
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token")
+        return n
+
+    src_cover = _doc_cover(src[0]) if src else False
+    new_cover = _doc_cover(new_doc_id)
+    src_addons = _count_addons(src[0]) if src else 0
+    new_addons = _count_addons(new_doc_id)
+
+    print_progress(f"封面：源 {'有' if src_cover else '无'} / 新 {'有' if new_cover else '无'}")
+    if src_cover and not new_cover:
+        print_progress("⚠ 源有封面但新文档缺失（跨租户 media-preview 失败？）")
+    print_progress(f"ISV 组件块：源 {src_addons} / 新 {new_addons}")
+    if src_addons > new_addons:
+        print_progress(f"⚠ 有 {src_addons - new_addons} 个 ISV 组件未还原")
+
+    return {
+        "src_cover": src_cover, "new_cover": new_cover,
+        "src_addons": src_addons, "new_addons": new_addons,
+        "cover_missing": bool(src_cover and not new_cover),
+        "addons_missing": max(0, src_addons - new_addons),
+    }
 
 
 def verify_image_blank_p(state: dict) -> dict:
@@ -672,6 +742,7 @@ def main():
     dup_result = verify_duplicate_li(state)
     grid_result = verify_grids(state)
     wb_result = verify_whiteboards(state)
+    cover_addons_result = verify_cover_and_addons(state)
     blank_p_result = verify_image_blank_p(state)
     callout_result = verify_callout(state)
     embed_result = verify_embedded(state)
@@ -685,6 +756,7 @@ def main():
         "grids": grid_result,
         "blank_p": blank_p_result,
         "whiteboards": wb_result,
+        "cover_addons": cover_addons_result,
         "embedded": embed_result,
         "cites": cite_result,
     }
@@ -725,7 +797,7 @@ def main():
         for i, issue in enumerate(ol_result.get("issues", []), 1):
             preview = " / ".join(issue.get("li_preview", []))[:80]
             print(f"    {i}. 含 {issue.get('li_count')} 个 li：{preview}...")
-        print("    建议：手动拆分（见 SKILL.md 关键经验），或重跑 clean_xml 修复后的 03_post_process.py")
+        print("    建议：手动拆分（见 references/api-limitations.md 限制 5），或重跑 clean_xml 修复后的 03_post_process.py")
     else:
         print("  ❌ ol 分离核验失败")
 
@@ -743,12 +815,15 @@ def main():
         print(f"  ⚠ {callout_result['bad_count']} 个 callout 内含 img（fix_callout_imgs 失败，需人工）")
 
     grid_missing = grid_result.get("missing", 0)
+    grid_imgs_missing = grid_result.get("imgs_missing", 0)
     if grid_result.get("src_img_grids", 0) == 0:
         pass
-    elif grid_missing == 0:
-        print("  ✅ 并排图 grid 全部还原")
-    else:
+    elif grid_missing == 0 and grid_imgs_missing == 0:
+        print(f"  ✅ 并排图 grid 全部还原（含图 {grid_result.get('new_grid_imgs', 0)} 张）")
+    elif grid_missing:
         print(f"  ⚠ {grid_missing} 个并排图 grid 未还原（限制 16），请检查 rebuild_grids")
+    else:
+        print(f"  ⚠ grid 数对上但列内少 {grid_imgs_missing} 张图（多图列未完整还原），请检查 rebuild_grids 多图逻辑")
 
     wb_missing = wb_result.get("missing", 0)
     if wb_result.get("src_whiteboards", 0) == 0:
@@ -757,6 +832,15 @@ def main():
         print(f"  ✅ 画板全部还原（{wb_result.get('new_whiteboards', 0)} 个，raw 保布局）")
     else:
         print(f"  ⚠ {wb_missing} 个画板未还原（多为源画板跨租户无读取权限）")
+
+    ca = cover_addons_result
+    if ca.get("src_cover"):
+        print("  ✅ 文档封面（背景图）已迁移" if ca.get("new_cover") else "  ⚠ 源有封面但新文档缺失（检查 migrate_cover / 跨租户权限）")
+    if ca.get("src_addons", 0):
+        if ca.get("addons_missing", 0) == 0:
+            print(f"  ✅ ISV 组件块（目录等）全部还原（{ca['new_addons']} 个）")
+        else:
+            print(f"  ⚠ {ca['addons_missing']} 个 ISV 组件未还原（检查 migrate_addons）")
 
     align_fixed = state.get("image_align_fixed") or {}
     if align_fixed.get("src", 0):

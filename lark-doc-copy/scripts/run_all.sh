@@ -108,6 +108,27 @@ echo "[执行] 第 4 步：内容、图片位置、重复项核验"
 echo "----------------------------------------"
 python3 "$SCRIPT_DIR/04_verify.py"
 
+# 第 4.5 步：在清理前，明确打印「真·主文档」链接（仅顶层）。
+# 否则主文档链接从不被显式打印，用户只能从 cite 列表里猜——而 cite 列表里
+# 可能出现同名引用文档，极易把引用副本误当成主文档（见 process_cites self 登记注释）。
+# state.json 会被第 5 步清理，所以必须在清理前读取并打印。
+if [ "${LARK_DOC_COPY_DEPTH:-0}" = "0" ]; then
+    python3 - <<'PYEOF'
+import json
+try:
+    s = json.load(open("state.json"))
+    url = s.get("new_doc_url") or (f"https://feishu.cn/docx/{s.get('new_doc_id')}" if s.get("new_doc_id") else None)
+    if url:
+        print("")
+        print("========================================")
+        print("  📄 主文档副本（这才是你要的源文档副本）")
+        print(f"  {url}")
+        print("========================================")
+except Exception:
+    pass
+PYEOF
+fi
+
 # 第 5 步：清理
 echo ""
 echo "[执行] 第 5 步：清理临时文件"

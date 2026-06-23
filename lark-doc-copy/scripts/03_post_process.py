@@ -1204,17 +1204,18 @@ def rebuild_grids(state: Dict) -> int:
     return success
 
 
-def _whiteboard_anchor(src_blocks: List[Dict], i: int, mapping: Dict[str, str]):
-    """为 src_blocks[i]（whiteboard）找新文档里的插入锚点 block id。
+def _preceding_mapped_anchor(src_blocks: List[Dict], i: int, mapping: Dict[str, str]):
+    """为 src_blocks[i]（whiteboard / sheet 等需重建的对象）找新文档里的插入锚点。
 
-    向前找最近的「已映射顶级块」：跳过空 p、img、whiteboard、grid（grid 不保留）；
-    前驱是 ol/ul 时容器 id 不稳定，改用其末项已映射的 li 作锚点。找不到返回 None。
+    向前找最近的「已映射顶级块」：跳过空 p 和所有不保留/单独迁移的对象块
+    （img、whiteboard、sheet、synced-source、grid）；前驱是 ol/ul 时容器 id
+    不稳定，改用其末项已映射的 li 作锚点。找不到返回 None。
     """
     for j in range(i - 1, -1, -1):
         blk = src_blocks[j]
         if blk["depth"] != 0:
             continue
-        if blk["tag"] in ("img", "whiteboard", "grid"):
+        if blk["tag"] in ("img", "whiteboard", "sheet", "synced-source", "grid"):
             continue
         if blk["tag"] == "p" and not blk["all_text"]:
             continue
@@ -1267,7 +1268,7 @@ def migrate_whiteboards(state: Dict, mapping: Dict[str, str]) -> int:
                 tok = tm.group(1)
         if not tok:
             continue
-        boards.append({"src_token": tok, "anchor_new_id": _whiteboard_anchor(src_blocks, i, mapping)})
+        boards.append({"src_token": tok, "anchor_new_id": _preceding_mapped_anchor(src_blocks, i, mapping)})
 
     if not boards:
         print_progress("源文档无画板，跳过")
@@ -1336,6 +1337,119 @@ def migrate_whiteboards(state: Dict, mapping: Dict[str, str]) -> int:
             print_progress(f"  ⚠ 画板 {tok[:12]} 空白块已插入但 raw 写入失败，请人工补救")
 
     print_progress(f"画板迁移成功: {success}/{len(boards)}")
+    return success
+
+
+def _xml_escape(s: str) -> str:
+    """转义单元格文本里的 XML 特殊字符（& < >），text() 内容只需这三个。"""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _read_sheet_grid(token: str, sheet_id: str) -> List[List[str]]:
+    """读内嵌电子表格的已用区域，返回去掉尾部空行/空列后的二维文本网格。"""
+    result = run_lark_cli_json([
+        "sheets", "+cells-get",
+        "--spreadsheet-token", token,
+        "--sheet-id", sheet_id,
+        "--range", "A1:Z200",
+    ], timeout=120)
+    if not result or not result.get("ok"):
+        return []
+    rows = []
+    for rg in result.get("data", {}).get("ranges", []):
+        for row in rg.get("cells", []):
+            rows.append(["" if c.get("value") in (None, "") else str(c.get("value")) for c in row])
+    # 去尾部全空行
+    while rows and not any(c.strip() for c in rows[-1]):
+        rows.pop()
+    if not rows:
+        return []
+    # 去尾部全空列
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    while ncol > 1 and all(not r[ncol - 1].strip() for r in rows):
+        ncol -= 1
+        rows = [r[:ncol] for r in rows]
+    return rows
+
+
+def _grid_to_table_xml(rows: List[List[str]]) -> str:
+    """把二维文本网格渲染成飞书原生 table XML（首行作表头）。"""
+    ncol = len(rows[0])
+    cols = "".join("<col/>" for _ in range(ncol))
+    head = "".join(f'<th vertical-align="top"><p>{_xml_escape(c)}</p></th>' for c in rows[0])
+    body = ""
+    for r in rows[1:]:
+        body += "<tr>" + "".join(
+            f'<td vertical-align="top"><p>{_xml_escape(c)}</p></td>' for c in r
+        ) + "</tr>"
+    return f'<table><colgroup>{cols}</colgroup><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+
+
+def migrate_sheets(state: Dict, mapping: Dict[str, str]) -> int:
+    """第 7.8 步：迁移源文档内嵌电子表格（sheet），渲染成原生 table。
+
+    `<sheet token=... sheet-id=...>` 是 token 对象，`docs +create` 无法从跨租户
+    token 重建、会被静默丢弃（实测：OpenClaw 指南 3 张内嵌表全部丢失）。本步骤读
+    内嵌表格的单元格内容，渲染成飞书原生 table（首行作表头）插到对应锚点后——
+    内容逐字一致、视觉接近，且不依赖跨租户复制权限。无读取权限时跳过并告警。
+    """
+    print_step("第 7.8 步：迁移内嵌表格（sheet）")
+
+    new_doc_id = state["new_doc_id"]
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    src_blocks = xml_to_blocks(source_xml)
+
+    sheets = []
+    for i, b in enumerate(src_blocks):
+        if b["tag"] != "sheet" or not b.get("id"):
+            continue
+        m = re.search(rf'<sheet\b[^>]*?id="{re.escape(b["id"])}"[^>]*?>', source_xml)
+        if not m:
+            continue
+        tok = re.search(r'\stoken="([^"]+)"', m.group(0))
+        sid = re.search(r'\ssheet-id="([^"]+)"', m.group(0))
+        if not tok or not sid:
+            continue
+        sheets.append({
+            "token": tok.group(1), "sheet_id": sid.group(1),
+            "anchor_new_id": _preceding_mapped_anchor(src_blocks, i, mapping),
+        })
+
+    if not sheets:
+        print_progress("源文档无内嵌表格，跳过")
+        return 0
+
+    print_progress(f"源文档内嵌表格: {len(sheets)} 个")
+    success = 0
+    # 反向插入：同一 anchor 多个表时 block_insert_after 会反序，反向遍历抵消
+    for sh in reversed(sheets):
+        anchor = sh["anchor_new_id"]
+        sig = f"{sh['token'][:10]}/{sh['sheet_id']}"
+        if not anchor:
+            print_progress(f"  ✗ 内嵌表 {sig} 找不到锚点，跳过")
+            continue
+        rows = _read_sheet_grid(sh["token"], sh["sheet_id"])
+        if not rows:
+            print_progress(f"  ✗ 内嵌表 {sig} 读取失败（无权限/空表），跳过")
+            continue
+        ins = run_lark_cli_json([
+            "docs", "+update", "--api-version", "v2",
+            "--doc", new_doc_id,
+            "--command", "block_insert_after",
+            "--block-id", anchor,
+            "--content", _grid_to_table_xml(rows),
+            "--doc-format", "xml",
+        ], timeout=60)
+        if ins and ins.get("ok") and ins.get("data", {}).get("result") == "success":
+            success += 1
+            print_progress(f"  ✓ 内嵌表 {sig} 已还原为原生 table（{len(rows)} 行）")
+        else:
+            print_progress(f"  ⚠ 内嵌表 {sig} 插入失败，请人工补救")
+
+    print_progress(f"内嵌表格迁移成功: {success}/{len(sheets)}")
+    update_state(migrated_sheets={"src": len(sheets), "done": success})
     return success
 
 
@@ -1422,6 +1536,9 @@ def main():
 
     # 第 7.7 步：迁移画板（whiteboard）
     migrate_whiteboards(state, mapping)
+
+    # 第 7.8 步：迁移内嵌表格（sheet → 原生 table）
+    migrate_sheets(state, mapping)
 
     # 第 8 步：修复 seq
     fix_list_seq(state, mapping)

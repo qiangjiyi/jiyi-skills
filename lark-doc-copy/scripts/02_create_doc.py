@@ -32,7 +32,7 @@ from lib import (
 
 
 def clean_xml(content: str) -> str:
-    """清理 XML：去除 block ID、图片标签、画板标签、空 grid 容器"""
+    """清理 XML：去除 block ID、图片/画板/内嵌表格标签、解包同步块、空 grid 容器"""
     # 去除 block ID
     content = re.sub(r'\s+id="[^"]*"', '', content)
     # 去除 seq-level 属性
@@ -79,6 +79,14 @@ def clean_xml(content: str) -> str:
         flags=re.DOTALL,
     )
 
+    # 同步块（synced-source / synced-reference）解包：保留内部正文。
+    # 同步块是飞书的「内容同步」对象，docs +create 不支持该标签、会连同内部正文
+    # 一起静默丢弃（实测：OpenClaw 指南「第一阶段 Clawd/Clawdbot」三段正文消失）。
+    # synced-source 的正文内嵌在 XML 里，去掉外层包裹标签后这些 <p> 就降级成普通
+    # 顶级段落、随 create 正常落地（synced-reference 内部通常为空，去壳后无残留）。
+    content = re.sub(r'</?synced-source\b[^>]*>', '', content)
+    content = re.sub(r'</?synced-reference\b[^>]*>', '', content)
+
     # 去除 img 标签（图片单独处理）
     content = re.sub(r'<img[^>]*?/>', '', content)
     # 去除 whiteboard 标签（画板单独处理）：画板是 token 对象，docs +create 无法从
@@ -88,6 +96,10 @@ def clean_xml(content: str) -> str:
     content = re.sub(
         r'<whiteboard\b[^>]*?>.*?</whiteboard>', '', content, flags=re.DOTALL
     )
+    # 去除 sheet 标签（内嵌电子表格单独处理）：与画板同理，token 对象 create 无法
+    # 重建、静默丢弃。改由 03 的 migrate_sheets 读单元格、渲染成原生 table 还原。
+    content = re.sub(r'<sheet\b[^>]*?/>', '', content)
+    content = re.sub(r'<sheet\b[^>]*?>.*?</sheet>', '', content, flags=re.DOTALL)
     # 去除空 grid 容器（删 img 后 grid 里只剩空 column）。支持任意列数，
     # 否则 3 列及以上的并排图 grid 删图后会残留空 grid，且会和 rebuild_grids
     # 重建的 grid 重复。grid 的并排布局由第 7.6 步 rebuild_grids 重新还原。

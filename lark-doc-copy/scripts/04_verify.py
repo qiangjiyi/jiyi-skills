@@ -400,6 +400,49 @@ def verify_whiteboards(state: dict) -> dict:
     return {"src_whiteboards": src_wb, "new_whiteboards": new_wb, "missing": missing}
 
 
+def verify_embedded(state: dict) -> dict:
+    """第 10.66 步：内嵌对象（同步块 + 内嵌表格）迁移核验。
+
+    - 同步块（synced-source）：clean_xml 解包后正文降级为普通段落，核验每个同步块
+      的正文是否出现在新文档里（缺失说明解包失败）。
+    - 内嵌表格（sheet）：由 migrate_sheets 渲染成原生 table，核验迁移成功数。
+    """
+    print_step("第 10.66 步：内嵌对象（同步块/内嵌表格）迁移核验")
+
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    new_xml = fetch_doc_xml(state["new_doc_id"], detail="with-ids") or ""
+    new_text = re.sub(r"<[^>]+>", "", new_xml)
+
+    # 同步块正文是否还在
+    synced_missing = []
+    for m in re.finditer(r"<synced-source\b[^>]*>(.*?)</synced-source>", source_xml, re.DOTALL):
+        for pm in re.finditer(r"<p[^>]*>(.*?)</p>", m.group(1), re.DOTALL):
+            txt = re.sub(r"<[^>]+>", "", pm.group(1)).strip()
+            if txt and txt not in new_text:
+                synced_missing.append(txt[:30])
+    src_synced = len(re.findall(r"<synced-source\b", source_xml))
+
+    # 内嵌表格迁移结果（migrate_sheets 写入 state）
+    sheets = state.get("migrated_sheets") or {}
+    src_sheets = len(re.findall(r"<sheet\b", source_xml))
+    done_sheets = sheets.get("done", 0)
+
+    if src_synced:
+        print_progress(f"同步块: {src_synced} 个；正文缺失: {len(synced_missing)}")
+    if src_sheets:
+        print_progress(f"内嵌表格: 源 {src_sheets} / 已还原 {done_sheets}")
+    if not src_synced and not src_sheets:
+        print_progress("源文档无同步块/内嵌表格")
+
+    return {
+        "src_synced": src_synced,
+        "synced_missing": synced_missing,
+        "src_sheets": src_sheets,
+        "done_sheets": done_sheets,
+    }
+
+
 def verify_cites(state):
     """第 10.7 步：被引用文档（cite 递归）核验。
 
@@ -471,6 +514,7 @@ def main():
     dup_result = verify_duplicate_li(state)
     grid_result = verify_grids(state)
     wb_result = verify_whiteboards(state)
+    embed_result = verify_embedded(state)
     cite_result = verify_cites(state)
 
     results = {
@@ -480,6 +524,7 @@ def main():
         "duplicate_li": dup_result,
         "grids": grid_result,
         "whiteboards": wb_result,
+        "embedded": embed_result,
         "cites": cite_result,
     }
 
@@ -535,6 +580,18 @@ def main():
         print(f"  ✅ 画板全部还原（{wb_result.get('new_whiteboards', 0)} 个，raw 保布局）")
     else:
         print(f"  ⚠ {wb_missing} 个画板未还原（多为源画板跨租户无读取权限）")
+
+    if embed_result.get("src_synced", 0):
+        miss = embed_result.get("synced_missing", [])
+        if not miss:
+            print(f"  ✅ 同步块正文全部保留（{embed_result['src_synced']} 个）")
+        else:
+            print(f"  ⚠ {len(miss)} 段同步块正文缺失：{miss}")
+    if embed_result.get("src_sheets", 0):
+        if embed_result.get("done_sheets", 0) >= embed_result["src_sheets"]:
+            print(f"  ✅ 内嵌表格全部还原为原生 table（{embed_result['done_sheets']} 个）")
+        else:
+            print(f"  ⚠ 内嵌表格 {embed_result.get('done_sheets', 0)}/{embed_result['src_sheets']} 已还原，其余请检查 migrate_sheets")
 
     cite_total = cite_result.get("total", 0)
     if cite_total == 0:

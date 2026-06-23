@@ -1445,6 +1445,247 @@ def _preceding_mapped_anchor(src_blocks: List[Dict], i: int, mapping: Dict[str, 
     return None
 
 
+def _count_around_empty_p(flat, img_idx):
+    """返回 (before, after)：img 前后紧邻的连续空 <p> 数。"""
+    bk = 0
+    for j in range(img_idx - 1, -1, -1):
+        e = flat[j]
+        if e.tag == "p" and not "".join(e.itertext()).strip():
+            bk += 1
+        else:
+            break
+    ak = 0
+    for j in range(img_idx + 1, len(flat)):
+        e = flat[j]
+        if e.tag == "p" and not "".join(e.itertext()).strip():
+            ak += 1
+        else:
+            break
+    return bk, ak
+
+
+def _img_token_from_el(el) -> list:
+    """返回一个 img 元素可能的源 token 列表（src + 去掉后缀的 name）。
+    源/新文档对源 token 的存放位置不一致（源用 src，新用 name；新 src 是飞书新 token），
+    所以把两个候选都收下，调用方用 set 求交集。
+    """
+    out = []
+    src = el.get("src") or ""
+    if src:
+        out.append(src)
+    n = el.get("name") or ""
+    if n.endswith((".png", ".jpg")):
+        out.append(n[:-4])
+    elif n:
+        out.append(n)
+    return out
+
+
+def normalize_image_empty_p_around(state: Dict) -> int:
+    """第 7.65 步：校准每张图前后空 <p> 数量与源一致。
+
+    根因：`move_nested_images` 把嵌套在折叠标题里的图用 `block_move_after(前驱文本块, img)`
+    移到位，**没有继承** `move_images` 的 `blank_gap` 机制。`block_move_after` 把图紧贴
+    anchor 之后，**原本夹在 anchor 和图之间的图前空 p 被反吸到图后**——出现「互换」：
+    源 (图前 1, 图后 0) → 新 (图前 0, 图后 1)。本步骤用源/新逐图比对 (before, after)，
+    自动修正：
+    - **互换** `(B_s, A_s) == (A_n, B_n)`：从图后挪一个空 p 到图前
+    - **图前少** `B_s > B_n`：把图后一个空 p 挪到图前
+    - **图后少** `A_s > A_n`：把图前一个空 p 挪到图后
+    - 其他：记日志，留给人工
+    """
+    print_step("第 7.65 步：校准图片前后空 p 数量")
+
+    import xml.etree.ElementTree as ET
+
+    new_doc_id = state["new_doc_id"]
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    sroot = ET.fromstring(f"<root>{source_xml}</root>")
+    sflat = [c for c in sroot.iter() if c is not sroot]
+
+    new_xml = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
+    nroot = ET.fromstring(f"<root>{new_xml}</root>")
+    nflat = [c for c in nroot.iter() if c is not nroot]
+
+    # 源/新 token 索引：每个元素可能贡献多个候选 token（src + name 去后缀）
+    s_tokens: Dict[str, tuple] = {}  # token -> (flat_idx, el)
+    n_tokens: Dict[str, tuple] = {}
+    for i, e in enumerate(sflat):
+        if e.tag != "img":
+            continue
+        for t in _img_token_from_el(e):
+            if t and t not in s_tokens:
+                s_tokens[t] = (i, e)
+    for i, e in enumerate(nflat):
+        if e.tag != "img":
+            continue
+        for t in _img_token_from_el(e):
+            if t and t not in n_tokens:
+                n_tokens[t] = (i, e)
+
+    common = set(s_tokens) & set(n_tokens)
+    print_progress(f"源 {len(s_tokens)} / 新 {len(n_tokens)} token 候选, 交集 {len(common)}")
+
+    fixed = skipped = failed = 0
+    for tok, (si, _) in s_tokens.items():
+        if tok not in n_tokens:
+            continue
+        sb, sa = _count_around_empty_p(sflat, si)
+        ni, ne = n_tokens[tok]
+        # 新文档可能已被前一步改动，重新 fetch 拉最新结构
+        nb, na = _count_around_empty_p(nflat, ni)
+        if (sb, sa) == (nb, na):
+            continue
+
+        # 用最新的 new_xml 重新定位 img 和空 p 的 id（首次 fetch 已够，
+        # 后续操作可能改结构；为简单起见这里只复用首次结果——失败再 re-fetch）
+        latest_new = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
+        nflat2 = nflat  # 默认复用首次结果
+        if latest_new:
+            try:
+                nroot2 = ET.fromstring(f"<root>{latest_new}</root>")
+                nflat2 = [c for c in nroot2.iter() if c is not nroot2]
+            except ET.ParseError:
+                pass
+        # 优先用首次 nflat 里已经定位好的元素（已知 id 是有效字符串）
+        new_img = ne  # ne = n_tokens[tok][1]
+        # 验证在最新 nflat2 里也找得到（防御性）
+        if any(e is new_img for e in nflat2):
+            pass  # 同一个对象，直接用
+        else:
+            # 在 nflat2 里重新找
+            for e in nflat2:
+                if e.tag == "img" and tok in _img_token_from_el(e):
+                    new_img = e
+                    break
+        if not new_img.get("id"):
+            skipped += 1
+            print_progress(f"  ⚠ {tok[:12]} 拿不到 id，跳过 (new_img type={type(new_img).__name__}, ne.id={ne.get('id')!r})")
+            continue
+
+        # 重新数新文档的 (before, after)
+        idx2 = nflat2.index(new_img)
+        nb2, na2 = _count_around_empty_p(nflat2, idx2)
+
+        def mv_block(src_id, anchor_id):
+            return run_lark_cli_json([
+                "docs", "+update", "--api-version", "v2", "--doc", new_doc_id,
+                "--command", "block_move_after", "--block-id", anchor_id,
+                "--src-block-ids", src_id,
+            ], timeout=60)
+
+        def find_preceding_text_block(flat, img_idx):
+            for j in range(img_idx - 1, -1, -1):
+                e = flat[j]
+                if e.tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6",
+                             "callout", "blockquote", "pre", "li"):
+                    t = "".join(e.itertext()).strip()
+                    if t:
+                        return e
+            return None
+
+        def find_trailing_empty_p(flat, img_idx):
+            for j in range(img_idx + 1, len(flat)):
+                e = flat[j]
+                if e.tag == "p" and not "".join(e.itertext()).strip():
+                    return e
+                # 任何非空块出现就停
+                if "".join(e.itertext()).strip():
+                    return None
+            return None
+
+        def find_preceding_empty_p(flat, img_idx):
+            for j in range(img_idx - 1, -1, -1):
+                e = flat[j]
+                if e.tag == "p" and not "".join(e.itertext()).strip():
+                    return e
+                if "".join(e.itertext()).strip():
+                    return None
+            return None
+
+        img_id = new_img.get("id")
+        diff_b = sb - nb2  # > 0 表示新文档图前少
+        diff_a = sa - na2  # > 0 表示新文档图后少
+
+        # 策略 1: 互换 → 找一个空 p 互换位置
+        if (sb, sa) == (na2, nb2) and (sb + sa) > 0:
+            # 互换：把图后的空 p 挪到图前
+            # 即：先 block_move_after(前驱文本块, 空p) 让空 p 回到图前，
+            # 然后 block_move_after(空p, img) 把图放回空 p 之后
+            anchor_e = find_preceding_text_block(nflat2, idx2)
+            ep_e = find_trailing_empty_p(nflat2, idx2)
+            # 注：xml.etree.Element 无 __bool__ 重载，bool(e) 恒为 False，
+            # 不能用 `if e` / `e and ...`，必须 `e is not None`
+            cond = (anchor_e is not None and ep_e is not None
+                    and anchor_e.get("id") and ep_e.get("id"))
+            if not cond:
+                print_progress(f"  ⚠ {tok[:12]} 互换但缺 anchor/空p "
+                               f"(anchor={anchor_e.tag if anchor_e is not None else 'None'}(id={anchor_e.get('id') if anchor_e is not None else 'None'}) "
+                               f"ep={ep_e.tag if ep_e is not None else 'None'}(id={ep_e.get('id') if ep_e is not None else 'None'}))")
+            if cond:
+                # 1. 把图后的空 p 移到前驱文本块之后
+                r1 = mv_block(ep_e.get("id"), anchor_e.get("id"))
+                # 2. 把图移到刚放回的空 p 之后
+                if r1 and r1.get("ok"):
+                    r2 = mv_block(img_id, ep_e.get("id"))
+                    if r2 and r2.get("ok"):
+                        fixed += 1
+                        print_progress(f"  ✓ 互换 {tok[:12]}: src({sb},{sa}) -> 校准")
+                    else:
+                        failed += 1
+                        print_progress(f"  ✗ {tok[:12]} 互换第二步失败")
+                else:
+                    failed += 1
+                    print_progress(f"  ✗ {tok[:12]} 互换第一步失败")
+            else:
+                skipped += 1
+            continue
+
+        # 策略 2: 图前少 → 找图后的空 p 挪到图前
+        if diff_b > 0 and diff_a == 0:
+            anchor_e = find_preceding_text_block(nflat2, idx2)
+            ep_e = find_trailing_empty_p(nflat2, idx2)
+            if (anchor_e is not None and ep_e is not None
+                    and anchor_e.get("id") and ep_e.get("id")):
+                r1 = mv_block(ep_e.get("id"), anchor_e.get("id"))
+                if r1 and r1.get("ok"):
+                    r2 = mv_block(img_id, ep_e.get("id"))
+                    if r2 and r2.get("ok"):
+                        fixed += 1
+                        print_progress(f"  ✓ 图前补空p {tok[:12]}: src({sb},{sa}) new->?")
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+            else:
+                skipped += 1
+            continue
+
+        # 策略 3: 图后少 → 找图前的空 p 挪到图后
+        if diff_a > 0 and diff_b == 0:
+            ep_e = find_preceding_empty_p(nflat2, idx2)
+            if ep_e is not None and ep_e.get("id"):
+                # block_move_after(img, ep_e) 即可把空 p 挪到图后
+                r = mv_block(ep_e.get("id"), img_id)
+                if r and r.get("ok"):
+                    fixed += 1
+                    print_progress(f"  ✓ 图后补空p {tok[:12]}: src({sb},{sa}) new->?")
+                else:
+                    failed += 1
+            else:
+                skipped += 1
+            continue
+
+        # 其他复杂情况：跳过，记日志
+        skipped += 1
+        print_progress(f"  ⚠ {tok[:12]} 复杂 case src({sb},{sa}) new({nb2},{na2})，未修")
+
+    print_progress(f"空 p 校准: 成功 {fixed}, 跳过 {skipped}, 失败 {failed}")
+    update_state(empty_p_normalized={"fixed": fixed, "skipped": skipped, "failed": failed})
+    return fixed
+
+
 def migrate_whiteboards(state: Dict, mapping: Dict[str, str]) -> int:
     """第 7.7 步：迁移源文档画板（whiteboard）。
 
@@ -1749,6 +1990,9 @@ def main():
 
     # 第 7.6 步：还原并排图 grid 布局
     rebuild_grids(state)
+
+    # 第 7.65 步：校准图片前后空 p 数量（move_nested_images 没继承 blank_gap）
+    normalize_image_empty_p_around(state)
 
     # 第 7.7 步：迁移画板（whiteboard）
     migrate_whiteboards(state, mapping)

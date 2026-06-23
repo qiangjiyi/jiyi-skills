@@ -43,7 +43,7 @@ bash scripts/run_all.sh "https://xxx.feishu.cn/docx/<token>"
 | **0.5** | **`scripts/00_try_native.py`** | **优先尝试原生 `drive files copy` 复制主文档**（保真最高、最快、无扒取 bug）；成功则 `run_all.sh` 跳过 1/2/3，失败退回扒取重建 |
 | 1+2 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 |
 | 3+4 | `scripts/02_create_doc.py` | （兜底）创建新文档（默认根目录，可 `--target-dir-token` 指定） |
-| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、嵌套图、对齐、还原 grid、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
+| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、嵌套图、对齐、还原 grid、校准空 p、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
 | 9.5 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（探测权限 → 优先原生复制 → 兜底递归扒取 → 重指向 cite/链接） |
 | 10+11 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + grid 还原核验 + cite 引用核验（原生复制模式下只核验 cite） |
 | 12 | `scripts/05_cleanup.py` | 清理临时文件 |
@@ -111,6 +111,8 @@ python3 scripts/05_cleanup.py
 第 7.55 步：还原图片对齐（左/右）← 原生 API replace_image
   ↓
 第 7.6 步：还原并排图 grid 布局
+  ↓
+第 7.65 步：校准图片前后空 p 数量 ← 源/新逐图比对 (before, after)，互换案例挪空 p
   ↓
 第 7.7 步：迁移画板（whiteboard）← 读 raw 节点重建，保留原布局
   ↓
@@ -206,6 +208,20 @@ python3 scripts/05_cleanup.py
 **核验**：`04_verify` 的 `verify_image_positions` 用 ElementTree 数「文末堆积图片数」源/新对比，多出即有图卡在文末（嵌套图没移走）。
 
 > 为什么不直接让 `xml_to_blocks` 递归进 heading：那会牵动 `build_id_mapping`/`fix_list_seq`/所有核验，且 `compute_image_anchors` 的三模式锚点逻辑都假设 anchor 是 depth-0 顶级块；改动面大、风险高。`move_nested_images` 作为独立补救步骤，只处理「漏网的嵌套图」，不碰已调好的主路径。
+
+### 1.4 图片前后空 <p> 数量校准
+
+**问题**：`move_nested_images` 把嵌套在折叠标题里的图用 `block_move_after(前驱文本块, img)` 移到位，**没有继承** `move_images` 的 `blank_gap` + `_nth_empty_p_after` 机制（见关键经验 1 的「图前空行保留」段）。结果：原本夹在 anchor 与图之间的「图前空 p」被 `block_move_after` 反吸到图后，**空 p 分布互换**——源 `(图前 1, 图后 0)` → 新 `(图前 0, 图后 1)`。实测：OpenClaw 指南「附：阿里云百炼」h4 标题上方多出 1 个空行（其实是 HS1Gb 图前空 p 被搬到了图后）。
+
+**修复**：第 7.65 步 `normalize_image_empty_p_around`（在 `rebuild_grids` 之后）源/新逐图比对 `(before, after)`，自动修正三类常见 case：
+- **swap** `(B_s, A_s) == (A_n, B_n)`（最常见）：从图后挪一个空 p 到图前（`block_move_after(前驱文本块, 空p)` → `block_move_after(空p, img)`）。
+- **front_lost** `B_s > B_n, A_s == A_n`：把图后一个空 p 挪到图前。
+- **back_lost** `A_s > A_n, B_s == B_n`：把图前一个空 p 挪到图后。
+- **other**（复杂 case）：记日志，留给人工。
+
+**核验**：`04_verify` 的 `verify_image_blank_p` 列出源/新每张图 (before, after) 分布，按 `swapped/front_lost/back_lost/other` 分类报告。
+
+**关键陷阱（2026-06-23 实测）**：Python `xml.etree.Element` **没有 `__bool__` 重载**，所有 Element 都视为 falsy（无论有没有子节点）！写 `if anchor_e and ep_e` 永远 False，必须 `if anchor_e is not None and ep_e is not None`。**所有 ElementTree 处理代码都用 `is not None` 替代 truthy check**。
 
 ### 2. 有序列表序号
 
@@ -423,6 +439,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | 图片对齐（左/右）不保留（XML 接口无 align，media-insert 默认居中） | `03` `fix_image_align`（原生 blocks API 读源图 align → `replace_image` 同 token 带 align+scale 设回）；`04` 状态报告 | 关键经验 1.2 |
 | grid 并排图布局丢失（变竖排） | `03` `rebuild_grids`（移图入新建 grid 列）+ 原生 API 还原列宽；`04` `verify_grids` 核验 | 关键经验 6.5 / api-limitations 16 |
 | 画板（whiteboard）被 create 静默丢弃 | `02` `clean_xml` 剥离 whiteboard；`03` `migrate_whiteboards`（读源 raw 节点 → 建空白板 → raw 覆盖写入，**raw 保布局**）；`04` `verify_whiteboards` 核验 | 关键经验 6.6 |
+| `move_nested_images` 不继承 blank_gap → 图前/图后空 p 互换 | `03` `normalize_image_empty_p_around`（源/新逐图比对 (before, after)，互换案例挪空 p）；`04` `verify_image_blank_p` 诊断 | 关键经验 1.4 |
 | 同步块（synced-source）/ 内嵌表格（sheet）被 create 静默丢弃 | `02` `clean_xml` 解包同步块、剥离 sheet；`03` `migrate_sheets`（读单元格渲染成原生 table）；`04` `verify_embedded` 核验 | 关键经验 6.7 |
 | 连续堆叠图第二张及之后定位丢失（漂到无关章节） | `03` `is_anchorable_top` 跳过 img，同组图共用上游文本 anchor | api-limitations 17 |
 | 折叠标题/段落内的嵌套图片对 `xml_to_blocks` 不可见 → 不被锚定、堆文末 | `03` `move_nested_images`（ElementTree 全量扁平化找嵌套图 + 文本锚点重定位）；`04` 文末堆积图核验 | 关键经验 1.3 |
@@ -449,7 +466,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | `scripts/00_try_native.py` | 优先原生复制主文档（`drive files copy`）；成功则跳过 01/02/03 | lib.py, cite_lib.py |
 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 | lib.py, preflight.sh |
 | `scripts/02_create_doc.py` | 创建新文档（默认根目录） | lib.py, 01_fetch_source.py |
-| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + 还原 grid + 迁移画板/内嵌表格 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
+| `scripts/03_post_process.py` | 映射 + 目录锚点 + 图片 + 还原 grid + 校准空 p + 迁移画板/内嵌表格 + seq + 合并连续 blockquote | lib.py, 02_create_doc.py |
 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（复制 + 递归 + 重指向） | lib.py, cite_lib.py, 03_post_process.py |
 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + 重复 li 检测 + cite 引用核验 | lib.py, process_cites.py |
 | `scripts/05_cleanup.py` | 清理临时文件（含 registry 与 `_cite_*` 工作目录） | lib.py |

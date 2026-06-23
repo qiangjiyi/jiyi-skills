@@ -426,6 +426,94 @@ def verify_whiteboards(state: dict) -> dict:
     return {"src_whiteboards": src_wb, "new_whiteboards": new_wb, "missing": missing}
 
 
+def verify_image_blank_p(state: dict) -> dict:
+    """第 10.65 步：诊断图片前后空 <p> 数量是否与源一致（只诊断，不修）。
+
+    `normalize_image_empty_p_around`（03 第 7.65 步）会修 `swap/front_lost/back_lost`
+    三类常见 case。本函数列出源/新逐图 (before, after) 空 p 分布，统计异常，便于
+    评估覆盖度。
+    """
+    import xml.etree.ElementTree as ET
+    from collections import defaultdict
+    print_step("第 10.65 步：图片前后空 p 一致性诊断")
+
+    with open(state["source_xml_path"], "r", encoding="utf-8") as f:
+        source_xml = f.read()
+    new_xml = fetch_doc_xml(state["new_doc_id"], detail="with-ids") or ""
+
+    def flatten(root):
+        return [c for c in root.iter() if c is not root]
+
+    def img_token(el):
+        n = el.get("name", "")
+        if n.endswith((".png", ".jpg")):
+            return n[:-4]
+        if n:
+            return n
+        return el.get("src", "")
+
+    def count_around(flat, img_idx):
+        bk = 0
+        for j in range(img_idx - 1, -1, -1):
+            e = flat[j]
+            if e.tag == "p" and not "".join(e.itertext()).strip():
+                bk += 1
+            else:
+                break
+        ak = 0
+        for j in range(img_idx + 1, len(flat)):
+            e = flat[j]
+            if e.tag == "p" and not "".join(e.itertext()).strip():
+                ak += 1
+            else:
+                break
+        return bk, ak
+
+    sflat = flatten(ET.fromstring(f"<root>{source_xml}</root>"))
+    nflat = flatten(ET.fromstring(f"<root>{new_xml}</root>"))
+    s_by, n_by = {}, {}
+    for i, e in enumerate(sflat):
+        if e.tag == "img":
+            t = img_token(e)
+            if t and t not in s_by:
+                s_by[t] = (i, e)
+    for i, e in enumerate(nflat):
+        if e.tag == "img":
+            t = img_token(e)
+            if t and t not in n_by:
+                n_by[t] = (i, e)
+    common = set(s_by) & set(n_by)
+    by_pattern = defaultdict(list)
+    for tok in common:
+        if tok not in n_by:
+            continue
+        sb, sa = count_around(sflat, s_by[tok][0])
+        nb, na = count_around(nflat, n_by[tok][0])
+        if (sb, sa) == (nb, na):
+            continue
+        # 分类：互换 / front_lost / back_lost / other
+        if (sb, sa) == (na, nb) and (sb + sa) > 0:
+            pat = "swapped"
+        elif sb > nb and sa == na:
+            pat = "front_lost"
+        elif sa > na and sb == nb:
+            pat = "back_lost"
+        else:
+            pat = "other"
+        by_pattern[pat].append(tok)
+
+    print_progress(f"源图: {len(s_by)} 张, 新图: {len(n_by)} 张, 交集: {len(common)}, 分布不一致: {sum(len(v) for v in by_pattern.values())}")
+    for pat, toks in by_pattern.items():
+        print_progress(f"  {pat}: {len(toks)} (例 {toks[0][:14] if toks else '-'})")
+
+    return {
+        "src_imgs": len(s_by),
+        "new_imgs": len(n_by),
+        "common": len(common),
+        "by_pattern": {k: len(v) for k, v in by_pattern.items()},
+    }
+
+
 def verify_embedded(state: dict) -> dict:
     """第 10.66 步：内嵌对象（同步块 + 内嵌表格）迁移核验。
 
@@ -540,6 +628,7 @@ def main():
     dup_result = verify_duplicate_li(state)
     grid_result = verify_grids(state)
     wb_result = verify_whiteboards(state)
+    blank_p_result = verify_image_blank_p(state)
     embed_result = verify_embedded(state)
     cite_result = verify_cites(state)
 
@@ -549,6 +638,7 @@ def main():
         "ol_separation": ol_result,
         "duplicate_li": dup_result,
         "grids": grid_result,
+        "blank_p": blank_p_result,
         "whiteboards": wb_result,
         "embedded": embed_result,
         "cites": cite_result,
@@ -593,6 +683,14 @@ def main():
         print("    建议：手动拆分（见 SKILL.md 关键经验），或重跑 clean_xml 修复后的 03_post_process.py")
     else:
         print("  ❌ ol 分离核验失败")
+
+    bp = blank_p_result.get("by_pattern", {})
+    bp_total = sum(bp.values())
+    if bp_total == 0:
+        if blank_p_result.get("common", 0) > 0:
+            print(f"  ✅ 图片前后空 p 全部对齐（{blank_p_result['common']} 张）")
+    else:
+        print(f"  ⚠ 图片空 p 分布异常 {bp_total} 张: " + ", ".join(f"{k}={v}" for k, v in bp.items()) + "（normalize_image_empty_p_around 应已修 swapped/front_lost/back_lost）")
 
     grid_missing = grid_result.get("missing", 0)
     if grid_result.get("src_img_grids", 0) == 0:

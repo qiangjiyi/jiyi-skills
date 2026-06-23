@@ -155,7 +155,7 @@ python3 scripts/05_cleanup.py
 ### 1. 图片移动（最容易出错，已自动化）
 
 `compute_image_anchors` + `move_images` 按图片前驱 top-level block 分三模式自动处理，**所有 anchor 都用 top-level block，绝不用容器末项 li**（规避 `block_move_after` 陷阱）：
-- **direct**：前驱是 p/h/callout/blockquote 或图片在 grid 内/后 → 直接 anchor 到该 block
+- **direct**：前驱是 p/h/callout/blockquote/pre(代码块) 或图片在 grid 内/后 → 直接 anchor 到该 block
 - **two_step**：前驱是 ol/ul + 有非空 p 后继 → 先把 img 移到后继 p 之后，再把后继 p 移到 img 之后（= 5.1 方案 A 自动化），得到 `ol, img, p`
 - **fallback**：前驱是 ol/ul 但无后继（夹在两个 ol 间/文末）→ 退回 ol 末 li，可能轻微越位，需人工或增强修正
 

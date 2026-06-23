@@ -284,7 +284,10 @@ def compute_image_anchors(state: Dict, mapping: Dict[str, str]) -> List[Dict]:
         #     移到 ol 最后一个 li 之后。改用 two_step：先把 img 移到「后继 p」之后，
         #     再把该后继 p 移到 img 之后 → 得到 ol, img, p（两步都用 top-level anchor）。
         #     若找不到可用后继（如夹在两个 ol 之间、或文末），退回 fallback（ol 末 li）。
-        MAPPABLE_TOP = ("p", "h1", "h2", "h3", "callout", "blockquote")
+        # pre（代码块）也是可直接锚定的顶级文本块：源文档常见「代码块 → 截图」，
+        # 若不含 pre，图片前驱是代码块时会落入 fallback、无锚点、卡在文末
+        # （实测 bug：OpenClaw 指南 9 张紧跟代码块的截图全部漂到文末）。
+        MAPPABLE_TOP = ("p", "h1", "h2", "h3", "callout", "blockquote", "pre")
 
         # 空 <p>（分隔空行）在文本映射里没有 key，也不是有意义的锚点；
         # 找前驱/后继时一律跳过，否则会得到 anchor_new_id=None（实测：3 张图

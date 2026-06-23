@@ -43,7 +43,7 @@ bash scripts/run_all.sh "https://xxx.feishu.cn/docx/<token>"
 | **0.5** | **`scripts/00_try_native.py`** | **优先尝试原生 `drive files copy` 复制主文档**（保真最高、最快、无扒取 bug）；成功则 `run_all.sh` 跳过 1/2/3，失败退回扒取重建 |
 | 1+2 | `scripts/01_fetch_source.py` | （兜底）读取源文档 + 下载图片 |
 | 3+4 | `scripts/02_create_doc.py` | （兜底）创建新文档（默认根目录，可 `--target-dir-token` 指定） |
-| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、还原 grid、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
+| 5-9 | `scripts/03_post_process.py` | （兜底）后处理（映射、目录锚点、图片、对齐、还原 grid、迁移画板、迁移内嵌表格、seq、合并 blockquote、去引用块灰底） |
 | 9.5 | `scripts/process_cites.py` | 处理被引用的其它飞书文档（探测权限 → 优先原生复制 → 兜底递归扒取 → 重指向 cite/链接） |
 | 10+11 | `scripts/04_verify.py` | 内容核验 + 图片位置核验 + grid 还原核验 + cite 引用核验（原生复制模式下只核验 cite） |
 | 12 | `scripts/05_cleanup.py` | 清理临时文件 |
@@ -105,6 +105,8 @@ python3 scripts/05_cleanup.py
 第 7 步：移动图片到正确位置 ← 重点
   ↓
 第 7.5 步：修复图片显示尺寸（scale）← 重点
+  ↓
+第 7.55 步：还原图片对齐（左/右）← 原生 API replace_image
   ↓
 第 7.6 步：还原并排图 grid 布局
   ↓
@@ -178,6 +180,16 @@ python3 scripts/05_cleanup.py
 **修复**：第 7.5 步 `fix_image_sizes`：读源 img 的 `width/height/scale`，用 `block_replace` 更新新 doc 对应图片的 scale。
 
 **匹配规则**：源 `<img src="<orig_token>">` 与新 `<img name="<orig_token>.png">`，源 src 是新 name（去掉 .png）的前缀。
+
+### 1.2 图片对齐（左/右）还原
+
+**问题**：飞书图片对齐（`align`：1=左 / 2=中 / 3=右）是 docx **原生 block 属性，XML 接口不暴露/不保留**，`media-insert` 上传默认居中。源文档里左/右对齐的图全变居中（实测：OpenClaw 指南 4 张左对齐截图变居中）。
+
+**修复**：第 7.55 步 `fix_image_align`：用原生 blocks API（`api GET /docx/v1/documents/{doc}/blocks`）读源图 `align`，对非居中（1/3）的图用 `replace_image`（原生 PATCH，同 token）设回。
+
+**两个坑**：
+- XML `block_replace`（fix_image_sizes 改 scale 用）会**清掉 align** → `fix_image_align` 必须在 `fix_image_sizes` **之后**跑。
+- `replace_image` 不带 `scale` 会把 **scale 重置成 1** → 调用时把新图当前 `width/height/scale` 一并传入，align 和 scale 都不丢（`replace_image` 接受 `token/width/height/align/scale`）。
 
 ### 2. 有序列表序号
 
@@ -392,6 +404,7 @@ skill 执行完成后，必须按以下格式输出（中文）：
 | block_replace 后相邻 li 内容重复 | `04` `verify_duplicate_li` 检测 | api-limitations 12 |
 | ol/ul 无 block ID、block_replace 后 ID 变化 | 全程靠文本匹配 + 每步重新 fetch | 关键经验 5 / api-limitations 6、7 |
 | 图片 scale/width/height 不保留（scale 默认全尺寸；media-insert 偶发把原生宽高写成占位 100×100） | `03` `fix_image_sizes`（还原 width/height/scale 三者） | 关键经验 1.1 / api-limitations 15 |
+| 图片对齐（左/右）不保留（XML 接口无 align，media-insert 默认居中） | `03` `fix_image_align`（原生 blocks API 读源图 align → `replace_image` 同 token 带 align+scale 设回）；`04` 状态报告 | 关键经验 1.2 |
 | grid 并排图布局丢失（变竖排） | `03` `rebuild_grids`（移图入新建 grid 列）+ 原生 API 还原列宽；`04` `verify_grids` 核验 | 关键经验 6.5 / api-limitations 16 |
 | 画板（whiteboard）被 create 静默丢弃 | `02` `clean_xml` 剥离 whiteboard；`03` `migrate_whiteboards`（读源 raw 节点 → 建空白板 → raw 覆盖写入，**raw 保布局**）；`04` `verify_whiteboards` 核验 | 关键经验 6.6 |
 | 同步块（synced-source）/ 内嵌表格（sheet）被 create 静默丢弃 | `02` `clean_xml` 解包同步块、剥离 sheet；`03` `migrate_sheets`（读单元格渲染成原生 table）；`04` `verify_embedded` 核验 | 关键经验 6.7 |

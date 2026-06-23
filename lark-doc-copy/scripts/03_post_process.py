@@ -618,6 +618,95 @@ def fix_image_sizes(state: Dict) -> int:
     return success
 
 
+def _list_doc_image_aligns(doc_id: str) -> Dict[str, int]:
+    """用原生 docx blocks API 列出文档所有图片块的非居中对齐。
+
+    返回 {image_token: align}，只收 align 1（左）/ 3（右）；居中（2 或缺省）省略。
+    分页拉取（page_size 500），有上限兜底防失控。
+    """
+    aligns = {}
+    page_token = None
+    for _ in range(50):
+        params = {"page_size": 500}
+        if page_token:
+            params["page_token"] = page_token
+        result = run_lark_cli_json([
+            "api", "GET",
+            f"/open-apis/docx/v1/documents/{doc_id}/blocks",
+            "--params", json.dumps(params),
+        ], timeout=120)
+        data = (result or {}).get("data")
+        if not data:
+            break
+        for b in data.get("items", []):
+            if b.get("block_type") == 27:  # image block
+                img = b.get("image", {})
+                if img.get("align") in (1, 3):
+                    aligns[img.get("token")] = img["align"]
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+    return aligns
+
+
+def fix_image_align(state: Dict) -> int:
+    """第 7.55 步：还原图片对齐（左/右）。
+
+    飞书图片对齐（align：1=左 2=中 3=右）是 docx 原生 block 属性，XML 接口不保留，
+    media-insert 上传默认居中——源文档里左/右对齐的图全变居中（实测：OpenClaw 指南
+    4 张左对齐截图变居中）。本步骤用原生 blocks API 读源图 align，对非居中的图用
+    `replace_image`（同 token、带 align）设回。
+
+    **必须在 fix_image_sizes 之后跑**：XML block_replace 改 scale 会清掉 align；
+    且 `replace_image` 不带 scale 会把 scale 重置成 1。故这里读新图**当前**
+    width/height/scale 一并随 align 传给 `replace_image`，align 和 scale 都不丢。
+    """
+    print_step("第 7.55 步：还原图片对齐（左/右）")
+
+    from cite_lib import _inspect_token  # 复用 wiki→docx 解析
+    src = _inspect_token(state["source_url"])
+    if not src:
+        print_progress("⚠ 无法解析源文档 token，跳过对齐还原")
+        return 0
+    src_aligns = _list_doc_image_aligns(src[0])
+    if not src_aligns:
+        print_progress("源文档无左/右对齐图片，跳过")
+        update_state(image_align_fixed={"src": 0, "done": 0})
+        return 0
+    print_progress(f"源文档非居中对齐图片: {len(src_aligns)} 张")
+
+    new_doc_id = state["new_doc_id"]
+    new_xml = fetch_doc_xml(new_doc_id, detail="with-ids") or ""
+    success = 0
+    for tok, al in src_aligns.items():
+        m = re.search(rf'<img\b[^>]*name="{re.escape(tok)}\.png"[^>]*/>', new_xml)
+        if not m:
+            continue
+        tag = m.group(0)
+        bid = re.search(r'\bid="([^"]+)"', tag)
+        nsrc = re.search(r'\bsrc="([^"]+)"', tag)
+        w = re.search(r'\bwidth="([^"]+)"', tag)
+        h = re.search(r'\bheight="([^"]+)"', tag)
+        if not (bid and nsrc and w and h):
+            continue
+        sc = re.search(r'\bscale="([^"]+)"', tag)
+        img_body = {"token": nsrc.group(1), "width": int(w.group(1)),
+                    "height": int(h.group(1)), "align": al}
+        if sc:
+            img_body["scale"] = float(sc.group(1))  # 保住 fix_image_sizes 设好的 scale
+        r = run_lark_cli_json([
+            "api", "PATCH",
+            f"/open-apis/docx/v1/documents/{new_doc_id}/blocks/{bid.group(1)}",
+            "--data", json.dumps({"replace_image": img_body}),
+        ], timeout=60)
+        if r and r.get("ok"):
+            success += 1
+
+    print_progress(f"对齐还原: {success}/{len(src_aligns)}")
+    update_state(image_align_fixed={"src": len(src_aligns), "done": success})
+    return success
+
+
 def fix_list_seq(state: Dict, mapping: Dict[str, str]) -> int:
     """
     第 8 步：上下文感知的有序列表 seq 修复
@@ -1530,6 +1619,9 @@ def main():
 
     # 第 7.5 步：修复图片显示尺寸（scale）
     fix_image_sizes(state)
+
+    # 第 7.55 步：还原图片对齐（左/右）— 须在 fix_image_sizes 之后
+    fix_image_align(state)
 
     # 第 7.6 步：还原并排图 grid 布局
     rebuild_grids(state)

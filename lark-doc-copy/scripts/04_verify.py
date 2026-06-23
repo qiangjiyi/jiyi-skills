@@ -581,6 +581,13 @@ def main():
     else:
         print(f"  ⚠ {wb_missing} 个画板未还原（多为源画板跨租户无读取权限）")
 
+    align_fixed = state.get("image_align_fixed") or {}
+    if align_fixed.get("src", 0):
+        if align_fixed.get("done", 0) >= align_fixed["src"]:
+            print(f"  ✅ 图片左/右对齐全部还原（{align_fixed['done']} 张）")
+        else:
+            print(f"  ⚠ 图片对齐 {align_fixed.get('done', 0)}/{align_fixed['src']} 已还原，其余请检查 fix_image_align")
+
     if embed_result.get("src_synced", 0):
         miss = embed_result.get("synced_missing", [])
         if not miss:

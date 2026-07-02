@@ -477,8 +477,14 @@ def _claude_history_projects(history: Path) -> dict[str, str]:
 def _claude_snippet(jsonl: Path) -> str:
     """Return a short human label for a Claude Code jsonl session.
 
-    Reads at most the first 8 KB — the first non-noise entry is almost always
-    within the first few lines. Skips:
+    Reads **line by line**, returning at the first usable text — the fixed
+    8 KB prefix used to clip sessions whose first user message sat behind
+    hundreds of KB of metadata (queue-operation / attachment / mode rows
+    from SDK-driven sessions like Coze bots). A 1 MiB hard cap protects
+    against runaway reads on pathological sessions that never emit a
+    user/assistant row.
+
+    Skips:
 
     - ``type=system`` rows (Claude inserts a ``subtype=local_command`` row
       right after every slash command, with top-level ``content`` literally
@@ -498,8 +504,11 @@ def _claude_snippet(jsonl: Path) -> str:
     — without the array form, every SDK-driven session (e.g. Coze bots)
     shows as ``(无摘要)``.
 
-    Falls back to the first available content if nothing else matches; empty
-    string when nothing is found within the 8 KB prefix.
+    Sidecar metadata (``aiTitle`` / ``lastPrompt``) is captured as it
+    passes, but doesn't trigger early-return: a real user/assistant
+    message, if present, is preferred over the sidecar.
+
+    Falls back to the sidecar when no usable text is found within the cap.
     """
     SLASH_NAME_RE = re.compile(r"<command-name>\s*(/\S+?)\s*</command-name>")
     SLASH_NAME_OPEN_RE = re.compile(r"<command-name>\s*(/\S+)")
@@ -508,11 +517,10 @@ def _claude_snippet(jsonl: Path) -> str:
         "queue-operation", "attachment", "mode",
         "permission-mode", "file-history-snapshot",
     })
-    try:
-        with jsonl.open(encoding="utf-8", errors="ignore") as f:
-            chunk = f.read(8192)
-    except OSError:
-        return ""
+    # Hard cap on how far into the jsonl we scan for a usable label.
+    # 1 MiB comfortably covers SDK-driven sessions that bury the first
+    # user message behind hundreds of KB of metadata.
+    MAX_SCAN_BYTES = 1 << 20  # 1 MiB
 
     def _msg_content(d: dict) -> str:
         """Content may live at top-level (system/assistant) or under message
@@ -542,37 +550,46 @@ def _claude_snippet(jsonl: Path) -> str:
 
     ai_title = ""
     last_prompt = ""
-    for line in chunk.splitlines():
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    bytes_read = 0
+    try:
+        with jsonl.open(encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                bytes_read += len(line.encode("utf-8", errors="ignore"))
+                if bytes_read > MAX_SCAN_BYTES:
+                    break
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-        # Sidecar metadata rows (ai-title / last-prompt) carry a usable label
-        # even for sessions that have no user/assistant message rows at all.
-        if not ai_title and d.get("aiTitle"):
-            ai_title = str(d["aiTitle"]).replace("\n", " ").strip()
-        if not last_prompt and d.get("lastPrompt"):
-            last_prompt = str(d["lastPrompt"]).replace("\n", " ").strip()
+                # Sidecar metadata rows (ai-title / last-prompt) carry a usable label
+                # even for sessions that have no user/assistant message rows at all.
+                # Capture as we pass, but don't early-return: a real message wins.
+                if not ai_title and d.get("aiTitle"):
+                    ai_title = str(d["aiTitle"]).replace("\n", " ").strip()
+                if not last_prompt and d.get("lastPrompt"):
+                    last_prompt = str(d["lastPrompt"]).replace("\n", " ").strip()
 
-        # Skip system rows (local_command, etc.) and meta rows (caveats).
-        if d.get("type") == "system":
-            continue
-        if d.get("isMeta"):
-            continue
-        if d.get("type") in SKIP_TYPES:
-            continue
+                # Skip system rows (local_command, etc.) and meta rows (caveats).
+                if d.get("type") == "system":
+                    continue
+                if d.get("isMeta"):
+                    continue
+                if d.get("type") in SKIP_TYPES:
+                    continue
 
-        c = _msg_content(d)
-        if not c.strip():
-            continue
+                c = _msg_content(d)
+                if not c.strip():
+                    continue
 
-        # Slash-command session: extract the command name and label it cleanly.
-        m = SLASH_NAME_RE.search(c) or SLASH_NAME_OPEN_RE.search(c)
-        if m:
-            return f"Slash: {m.group(1)}"
+                # Slash-command session: extract the command name and label it cleanly.
+                m = SLASH_NAME_RE.search(c) or SLASH_NAME_OPEN_RE.search(c)
+                if m:
+                    return f"Slash: {m.group(1)}"
 
-        return c.replace("\n", " ").strip()[:80]
+                return c.replace("\n", " ").strip()[:80]
+    except OSError:
+        return ""
     return (ai_title or last_prompt)[:80]
 
 

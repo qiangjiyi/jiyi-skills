@@ -406,12 +406,20 @@ def scan_claude() -> dict:
             continue
         jsonls = sorted(pdir.glob("*.jsonl"), key=mtime_of, reverse=True)
         if not jsonls:
-            # 0-jsonl 的孤儿目录：原脚本会整目录 rm -rf
+            # 0-jsonl 的目录可能是「真实项目还在，只是没会话文件」(empty dir)，
+            # 也可能是「真实项目已被删，目录是遗留残渣」(orphan dir)。
+            # 用 _resolve_claude_path() 试着解码真实路径，能解且存在 → 空目录；
+            # 解不出 / 不存在 → 才算孤儿。
+            resolved = _resolve_claude_path(pdir.name)
+            is_orphan = not resolved or not Path(resolved).exists()
+            label_path = resolved or _decode_claude(pdir.name)
+            label_suffix = "（空/孤儿目录）" if is_orphan else "（空目录）"
+            title_suffix = "（无会话文件的孤儿项目目录）" if is_orphan else "（无会话文件的项目目录）"
             agent["projects"].append(_make_project(
-                pid=pdir.name, label=_decode_claude(pdir.name) + "（空/孤儿目录）",
-                real_path="", orphan=True,
+                pid=pdir.name, label=label_path + label_suffix,
+                real_path=resolved or "", orphan=is_orphan,
                 sessions=[{
-                    "id": pdir.name, "title": "(无会话文件的孤儿项目目录)",
+                    "id": pdir.name, "title": title_suffix,
                     "snippet": "", "mtime": mtime_of(pdir), "size": dir_size(pdir),
                     "extra": {"claude_kind": "orphan_dir"},
                 }],
@@ -477,17 +485,29 @@ def _claude_snippet(jsonl: Path) -> str:
       ``<local-command-stdout></local-command-stdout>`` — that string is
       useless as a title and, if picked up first, makes every slash-command
       session look identical).
+    - ``type`` in ``{queue-operation, attachment, mode, permission-mode,
+      file-history-snapshot}`` — lifecycle/metadata rows with no usable text.
     - ``isMeta=true`` rows (synthetic system caveats like the
       ``<local-command-caveat>`` injected before slash command output).
     - Slash-command ``user`` rows whose ``message.content`` is the
       ``<command-name>/xxx</command-name>`` shell. For those we synthesize
       ``Slash: /xxx`` instead of dumping the XML tags into the title.
 
+    Handles both string content (older Claude Code) and the modern
+    ``message.content`` array of ``{type: "text", text: "..."}`` blocks
+    — without the array form, every SDK-driven session (e.g. Coze bots)
+    shows as ``(无摘要)``.
+
     Falls back to the first available content if nothing else matches; empty
     string when nothing is found within the 8 KB prefix.
     """
     SLASH_NAME_RE = re.compile(r"<command-name>\s*(/\S+?)\s*</command-name>")
     SLASH_NAME_OPEN_RE = re.compile(r"<command-name>\s*(/\S+)")
+    # Lifecycle / metadata rows: no usable label, skip up front.
+    SKIP_TYPES = frozenset({
+        "queue-operation", "attachment", "mode",
+        "permission-mode", "file-history-snapshot",
+    })
     try:
         with jsonl.open(encoding="utf-8", errors="ignore") as f:
             chunk = f.read(8192)
@@ -496,15 +516,28 @@ def _claude_snippet(jsonl: Path) -> str:
 
     def _msg_content(d: dict) -> str:
         """Content may live at top-level (system/assistant) or under message
-        (user entries in modern Claude Code)."""
-        c = d.get("content")
-        if isinstance(c, str):
-            return c
+        (user entries in modern Claude Code). The modern API stores it as a
+        list of blocks (text / tool_use / image / ...); we concatenate the
+        text blocks."""
+        def _flatten(content) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        t = blk.get("text")
+                        if isinstance(t, str):
+                            parts.append(t)
+                return "\n".join(parts)
+            return ""
+
+        flat = _flatten(d.get("content"))
+        if flat:
+            return flat
         m = d.get("message")
         if isinstance(m, dict):
-            mc = m.get("content")
-            if isinstance(mc, str):
-                return mc
+            return _flatten(m.get("content"))
         return ""
 
     ai_title = ""
@@ -526,6 +559,8 @@ def _claude_snippet(jsonl: Path) -> str:
         if d.get("type") == "system":
             continue
         if d.get("isMeta"):
+            continue
+        if d.get("type") in SKIP_TYPES:
             continue
 
         c = _msg_content(d)

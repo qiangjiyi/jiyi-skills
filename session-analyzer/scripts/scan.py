@@ -85,15 +85,15 @@ def scan_codex() -> dict:
         "name": "Codex",
         "root": str(root),
         "installed": state_db.exists(),
-        "note": "删除 Codex 会话前请先关闭 Codex App，避免删到正在打开的会话导致状态异常。",
+        "note": "删除 Codex 会话前请先关闭 ChatGPT App（2026-07-10 起独立 Codex App 已并入 ChatGPT），避免删到正在打开的会话导致状态异常。",
         "projects": [],
     }
     if not agent["installed"]:
         return agent
 
-    # immutable=1：Codex App 运行时库处于 WAL 模式、有活跃 -wal 文件，纯 mode=ro
+    # immutable=1：ChatGPT App（内嵌 Codex）运行时库处于 WAL 模式、有活跃 -wal 文件，纯 mode=ro
     # 会因无法建立 -shm/-wal 而报 "unable to open database file"。immutable 让只读
-    # 读取不依赖这些辅助文件，扫描无需先关 Codex App。
+    # 读取不依赖这些辅助文件，扫描无需先关 ChatGPT App。
     uri = f"file:{state_db}?mode=ro&immutable=1"
     try:
         con = sqlite3.connect(uri, uri=True)

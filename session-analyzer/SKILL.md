@@ -44,7 +44,7 @@ description: >
 
 **确定性管线，三段式：先扫描 → 固定决策 → 固定执行。** 全程无 act-vs-ask 分支：开场永远先
 只读扫描（不问、不可选）；扫到东西就按**写死的默认决策**直接往下跑，**不再用 AskUserQuestion
-询问**。默认决策恒为：① 关闭 Codex / Antigravity，② 开场兜底清理，③ 生成可删除交互报告——
+询问**。默认决策恒为：① 关闭 ChatGPT（含 Codex）/ Antigravity，② 开场兜底清理，③ 生成可删除交互报告——
 三项全做。**禁止**把关 app、兜底清理、报告形态当成可选项临场询问或边走边拍——那正是流程每次跑
 都漂移的根源。**唯一的偏离来源**：用户在对话里主动提出（如「别关 app」「只要只读静态报告」
 「都不要，只看摘要」）时，才按用户所说调整对应项；用户没说就一律走默认、不主动反问。
@@ -107,8 +107,10 @@ API 调用方式：
 先给一句结论先行的摘要（合计占用 / 占用最大的 Agent / 孤儿数），然后**不再用 AskUserQuestion
 询问**，直接按以下写死的默认决策进入 Step 3：
 
-1. **关闭 Codex / Antigravity：关。** 避免后续删除撞到 app 占用文件；只读扫描已跑完，关不关
-   都不影响结果。
+1. **关闭 ChatGPT / Antigravity：关。** 避免后续删除撞到 app 占用文件；只读扫描已跑完，关不关
+   都不影响结果。**说明**：2026-07-10 起 OpenAI 把独立 Codex APP 合并进了 ChatGPT APP，会话
+   数据（`~/.codex/`）现由 ChatGPT 进程持有，所以删除前要关的是 ChatGPT。脚本里同时保留
+   老的 "Codex" 进程名作为 legacy 兜底。
 2. **开场兜底清理：清。** 跑 `precleanup.py` 清空目录 / 卫星孤儿，默认移废纸篓、可逆。
 3. **报告形态：可删除交互报告**（`server.py`，本 skill 核心价值）。
 
@@ -121,15 +123,19 @@ API 调用方式：
 顺序恒为：**① 关 app → ② 兜底清理 → ③ 生成可删除交互报告 → ④ Step S 摘要。** 默认三项全做、
 逐步执行；仅当用户主动要求偏离（别关 app / 换只读报告 / 不要报告）时，才跳过或替换对应那一步。
 
-**① 关闭 Codex / Antigravity**（默认执行；用户主动说「别关」时才跳过）
+**① 关闭 ChatGPT / Antigravity**（默认执行；用户主动说「别关」时才跳过）
 
 ```bash
 bash scripts/run.sh close_agents.py
 ```
 
-`close_agents.py` 先 `osascript quit` 优雅退出、等不到再 `pkill` 强制结束，**只关这两个
-app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 Codex 正在运行，
-即将自动关闭 Codex…」「✓ 已关闭 Codex」），**agent 要把这些信息如实转述给用户**。
+`close_agents.py` 先 `osascript quit` 优雅退出、等不到再 `pkill` 强制结束，**只关这两类
+app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 ChatGPT 正在运行，
+即将自动关闭 ChatGPT…」「✓ 已关闭 ChatGPT」），**agent 要把这些信息如实转述给用户**。
+
+> **为什么关的是 ChatGPT 而不是 Codex**：OpenAI 已于 2026-07-10 把独立 Codex APP 合并进
+> ChatGPT APP，会话数据（`~/.codex/`）现由 ChatGPT 进程持有；老版独立 Codex APP 用户
+> 脚本也兼容（同时检测 `Codex` 进程名）。
 
 **② 开场兜底清理**（默认执行；用户主动说「别清」时才跳过）
 
@@ -252,7 +258,7 @@ session-analyzer/
 ├── SKILL.md
 ├── scripts/
 │   ├── scan.py                    # 只读扫描三 Agent → JSON
-│   ├── close_agents.py            # 关闭 Codex / Antigravity（Step 2 选了才跑）
+│   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（Step 2 选了才跑）
 │   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）
 │   ├── agyhub_summaries.py        # Antigravity 索引 .pb 解析 + 按 id 剔除（scan/删除共用）
 │   ├── build_report.py            # 注入 DELETE_CONFIG=null → 静态只读报告（入口一）

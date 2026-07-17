@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""删除前关闭 Codex / Antigravity。
+"""删除前关闭 ChatGPT(内嵌 Codex) / Antigravity。
 
-两者删除都要求 app 关闭：Codex 删到正在打开的活跃线程会损坏状态；Antigravity 运行时会把
-内存里的侧栏列表回写覆盖索引、导致删除不生效。本脚本先尝试优雅退出（让 app 自行存盘），
-等不到再强制结束。设计成 skill 流程的 Step 0：先关，再扫描/删除。
+两者删除都要求 app 关闭：Codex 的会话 SQLite 仍落在 ~/.codex/，但 2026-07-10 起 OpenAI 把独立
+Codex APP 合并进了 ChatGPT APP，进程名 / osascript 名都是 "ChatGPT"，要关的是它；
+Antigravity 运行时会把内存里的侧栏列表回写覆盖索引、导致删除不生效。本脚本先尝试优雅
+退出（让 app 自行存盘），等不到再强制结束。设计成 skill 流程的 Step 0：先关，再扫描/删除。
 
-仅关闭这两个 app，不动其它任何进程。打印关了哪些，供 agent 据实告知用户。
+仅关闭这些 app，不动其它任何进程。打印关了哪些，供 agent 据实告知用户。
 """
 from __future__ import annotations
 
@@ -14,10 +15,15 @@ import subprocess
 import sys
 import time
 
-# (展示名 = macOS 上 osascript 的 application 名 = pgrep -x 的进程名, Windows 进程名)
+# (展示名, macOS 上 osascript 的 application 名 / pgrep -x 的进程名, Windows 进程名)
+#
+# 2026-07-10 起 OpenAI 把独立 Codex APP 合并进 ChatGPT APP，会话数据仍在 ~/.codex/，但宿主
+# app 是 ChatGPT（osascript 必须用这个名字）。保留 "Codex" 作 legacy 兜底，给少数仍在用
+# 老版独立 Codex APP 的用户；新装环境不会命中。
 APPS = [
-    ("Codex", "Codex.exe"),
-    ("Antigravity", "Antigravity.exe"),
+    ("ChatGPT", "ChatGPT", "ChatGPT.exe"),
+    ("Codex", "Codex", "Codex.exe"),
+    ("Antigravity", "Antigravity", "Antigravity.exe"),
 ]
 
 
@@ -67,25 +73,25 @@ def _say(msg: str) -> None:
     print(msg, flush=True)  # 强制 flush：后台/管道里也能被 agent 实时读到
 
 
-def close_one(disp: str, win_name: str) -> bool:
+def close_one(disp: str, mac_name: str, win_name: str) -> bool:
     """返回是否进行了关闭（原本就没运行返回 False）。逐步打印检测与关闭过程。"""
-    if not app_is_running(disp, win_name):
+    if not app_is_running(mac_name, win_name):
         _say(f"· {disp} 未运行，跳过。")
         return False
     _say(f"⚠ 检测到 {disp} 正在运行，即将自动关闭 {disp}…")
-    _graceful_quit(disp, win_name)
+    _graceful_quit(mac_name, win_name)
     for _ in range(30):  # 最多等 ~3s 优雅退出
-        if not app_is_running(disp, win_name):
+        if not app_is_running(mac_name, win_name):
             _say(f"✓ 已关闭 {disp}（优雅退出）。")
             return True
         time.sleep(0.1)
     _say(f"  {disp} 未响应优雅退出，强制结束…")
-    _force_kill(disp, win_name, hard=False)  # SIGTERM
+    _force_kill(mac_name, win_name, hard=False)  # SIGTERM
     time.sleep(0.4)
-    if app_is_running(disp, win_name):
-        _force_kill(disp, win_name, hard=True)  # SIGKILL
+    if app_is_running(mac_name, win_name):
+        _force_kill(mac_name, win_name, hard=True)  # SIGKILL
         time.sleep(0.3)
-    if app_is_running(disp, win_name):
+    if app_is_running(mac_name, win_name):
         _say(f"✗ 无法关闭 {disp}，请手动退出后重试。")
         return False
     _say(f"✓ 已强制关闭 {disp}。")
@@ -93,12 +99,12 @@ def close_one(disp: str, win_name: str) -> bool:
 
 
 def main() -> int:
-    _say("检查 Codex / Antigravity 运行状态…")
-    closed = [disp for disp, win in APPS if close_one(disp, win)]
+    _say("检查 ChatGPT（含 Codex）/ Antigravity 运行状态…")
+    closed = [disp for disp, mac, win in APPS if close_one(disp, mac, win)]
     if closed:
         _say("关闭完成：" + "、".join(closed) + "。可以继续扫描/删除了。")
     else:
-        _say("Codex / Antigravity 均未运行，无需关闭。")
+        _say("ChatGPT / Antigravity 均未运行，无需关闭。")
     _say("✓ DONE")
     return 0
 

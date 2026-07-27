@@ -15,6 +15,7 @@ import argparse
 import sys
 
 import agent_delete as ad
+from pathlib import Path
 
 
 def main() -> int:
@@ -26,6 +27,8 @@ def main() -> int:
     removed: list = []
     all_roots = [r for rs in ad.prune_roots().values() for r in rs]
     keep = ad._claude_live_sids()  # 活跃会话卫星目录，空也不清
+    # Antigravity 活跃会话 uuid 也加入 keep，避免空目录清理钻入保留会话的 brain 子目录
+    keep |= ad._antigravity_live_uuids(Path.home() / ".gemini" / "antigravity")
     keep_paths = ad._claude_live_memory_dirs()  # 仅护「仍有会话」项目的 memory，孤立壳可回收
     ad.prune_empty_dirs(all_roots, mode, removed, keep, keep_paths)
     orphans = ad.prune_claude_satellites(mode, removed)

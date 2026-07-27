@@ -25,10 +25,10 @@ description: >
 
 ## 铁律
 
-- **扫描只读。** `scan.py` 只做 `os.scandir`/`stat`/只读 SQLite SELECT/读 jsonl，绝不写盘。
-  删除只发生在 `server.py`（经 `agent_delete.py`），且只删扫描里出现过的会话/项目。
-  唯一的例外是扫描**之前**的 `precleanup.py`：它清空目录/卫星孤儿（默认废纸篓、可逆），
-  但 `scan.py` 本身仍严格只读。
+- **扫描只读。** `scan.py` 只做 `os.scandir`/`stat`/只读 SQLite SELECT/读 jsonl，绝不写盘，
+  也不自动清理 Codex 项目配置。删除只发生在 `server.py`（经 `agent_delete.py`），且只删扫描里
+  出现过的会话/项目。唯一的例外是扫描**之前**的 `precleanup.py`：它清空目录/卫星孤儿
+  （默认废纸篓、可逆），但 `scan.py` 本身仍严格只读。
 - **清理范围收死。** 空目录/孤儿清理只在各 Agent 自己的数据子树内自底向上进行
   （`agent_delete.prune_roots()` 列出的根），绝不删根本身、绝不越界——空目录有时是程序占位。
   判空时忽略 `.DS_Store`/`Thumbs.db`，否则只剩系统垃圾文件的目录会"扫了还删不干净"。
@@ -52,8 +52,11 @@ description: >
 ### Step 1 始终先做：只读扫描（不问、不可选）
 
 ```bash
-bash scripts/run.sh scan.py > /tmp/session_scan.json
+bash scripts/run.sh scan.py --json-out /tmp/session_scan.json
 ```
+
+> **推荐用 `--json-out` 写文件**（而不是 `>` 重定向）：彻底避免 stdout/stderr 混叠
+> 导致 JSON 解析失败。重定向写法仍可用，但依赖调用方正确分离 stderr。
 
 > **为什么用 `run.sh` 而不是 `python3 scripts/scan.py`：** agent 的 cwd 是当前项目目录
 > （如 `/Users/jiyi/Projects/active/<proj>`），不是 skill 根。直接用相对路径会
@@ -72,7 +75,11 @@ in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行�
 各 Agent 的会话/项目定义：
 - **Codex**（`~/.codex/`）：会话 = `state_5.sqlite` 的 `threads` 行（含 `unknown` 等所有 source）；项目按 `cwd` 聚合。
 - **Antigravity**（`~/.gemini/antigravity/`）：新版会话 = 侧栏索引 `agyhub_summaries_proto.pb` 里的每条记录（id/标题/时间/workspace 均解析自该 proto），按 workspace 路径归类成项目；兼容旧版未迁移时残留的 `conversations/<uuid>.pb`；无对应对话的 brain 目录单列「孤儿残留」。
-- **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该目录（真实路径优先从 `history.jsonl` 反查）；0-jsonl 的空目录单列为「空/孤儿目录」。
+- **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该编码目录。
+  真实路径按「session JSONL 顶层 `cwd` → `history.jsonl` 的 project → 编码目录启发式解码」取值；
+  JSONL cwd 即使已不存在仍是权威来源，不继续回退。编码 `project.id` 始终作为删除身份，
+  `label`/`real_path` 只用于展示和孤儿判断。匹配 `/_skill-runtime/releases/<digest>/runner`
+  的已清理临时目录会标记为「临时 Skill 运行目录已清理」；0-jsonl 的空目录单列为「空/孤儿目录」。
 
 **Multica 增强**：当 Claude Code 的项目目录匹配 Multica workspace 模式（`*multica-workspaces-<ws_id>-<task_prefix>-workdir`）时，scan.py 自动：
 1. 查找对应的 `~/multica_workspaces/<ws_id>/<task_id>/` 目录，读取 `.gc_meta.json` 判断任务完成状态
@@ -216,7 +223,9 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
       "projects": [                // ← list
         {
           "id": "...", "label": "...", "real_path": "...",
-          "orphan": false, "session_count": 0, "size": 0,
+          "orphan": false,
+          "orphan_reason": null,       // missing_workdir | temporary_skill_runtime | null
+          "session_count": 0, "size": 0,
           "multica_status": "cleanable",    // 仅 Multica 项目：cleanable | active
           "multica_workspace_path": "...", // 仅 Multica 项目
           "multica_cache_path": "...",     // 仅 Multica 项目
@@ -264,6 +273,8 @@ session-analyzer/
 │   ├── build_report.py            # 注入 DELETE_CONFIG=null → 静态只读报告（入口一）
 │   ├── server.py                  # 本地服务，注入启用态配置 → 带删除的交互报告（入口二）
 │   └── agent_delete.py            # 各 Agent 的删除处理器（server.py 调用）
+├── tests/
+│   └── test_scan.py               # Claude cwd/orphan + Codex 扫描只读回归测试
 └── assets/
     └── report_template.html       # 报告模板（只读/删除两态，看 __DELETE_CONFIG__ 切换）
 ```

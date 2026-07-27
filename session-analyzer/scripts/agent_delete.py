@@ -314,12 +314,43 @@ def delete_claude_multica_sessions(project_dirname: str, sids: list, mode: str,
 
 # ─────────────────────────── Antigravity ───────────────────────────
 
+def _antigravity_live_uuids(root: Path, exclude: set | None = None) -> set:
+    """Antigravity 仍存活的会话 uuid 全集（索引 + 对话文件 + brain 目录取并集）。
+    用于空目录清理的 keep_names 白名单：保护仍有会话的顶层目录不被钻进去误删空子目录。
+    exclude 里的 uuid 不计入（刚删的，它们的目录应该被清掉）。"""
+    exclude = exclude or set()
+    live: set[str] = set()
+    # 1. 侧栏索引里的
+    index_pb = root / "agyhub_summaries_proto.pb"
+    if index_pb.exists():
+        try:
+            for e in agyhub_summaries.list_entries(index_pb):
+                if e["id"] not in exclude:
+                    live.add(e["id"])
+        except Exception:
+            pass
+    # 2. conversations/ 下的对话文件（.pb + .db）
+    conv = root / "conversations"
+    if conv.is_dir():
+        for f in conv.iterdir():
+            if f.suffix in (".pb", ".db") and _UUID_RE.match(f.stem) and f.stem not in exclude:
+                live.add(f.stem)
+    # 3. brain/ 下的目录（兜底：即使索引和对话都没了，brain 还在也算存活）
+    brain = root / "brain"
+    if brain.is_dir():
+        for d in brain.iterdir():
+            if d.is_dir() and _UUID_RE.match(d.name) and d.name not in exclude:
+                live.add(d.name)
+    return live
+
+
 def delete_antigravity_sessions(uuids: list, mode: str) -> dict:
     root = HOME / ".gemini" / "antigravity"
     removed, errors = [], []
     for uuid in uuids:
         for p in (
             root / "conversations" / f"{uuid}.pb",
+            root / "conversations" / f"{uuid}.db",
             root / "annotations" / f"{uuid}.pbtxt",
             root / "brain" / uuid,
         ):
@@ -335,7 +366,11 @@ def delete_antigravity_sessions(uuids: list, mode: str) -> dict:
     except Exception as e:
         errors.append(f"{index_pb}: {e}")
         idx_removed = []
-    prune_empty_dirs(prune_roots()["antigravity"], mode, removed)  # 收尾：清删空了的卫星目录
+    # 收尾：清删空了的卫星目录。用索引 + conversations 下现存的 uuid 做白名单，
+    # 避免空目录清理钻入保留会话的 brain 子目录（如 .user_uploaded 等空子目录）
+    # 误删——那些即使为空也属于活跃会话，不应被碰。
+    live_uuids = _antigravity_live_uuids(root, set(uuids))
+    prune_empty_dirs(prune_roots()["antigravity"], mode, removed, keep_names=live_uuids)
     return {"removed": removed, "errors": errors, "index_removed": idx_removed}
 
 

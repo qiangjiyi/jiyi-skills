@@ -151,69 +151,9 @@ def scan_codex() -> dict:
             orphan=orphan or not cwd,
             sessions=sessions,
         ))
-    # Auto-clean stale project entries in config.toml (paths that no longer exist)
-    config_toml = root / "config.toml"
-    if config_toml.exists():
-        _codex_clean_stale_config(config_toml)
-
     _finalize_agent(agent)
     return agent
 
-
-def _codex_clean_stale_config(config_path: Path) -> None:
-    """Remove [projects."..."] sections from config.toml whose paths don't exist.
-    Silent — no return value, no report field. Just cleans up."""
-    proj_re = re.compile(r'^\[projects\."(.+?)"\]')
-    section_start_re = re.compile(r'^\[')
-
-    try:
-        lines = config_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-    except OSError:
-        return
-
-    # First pass: identify stale project paths
-    stale_paths: set[str] = set()
-    for line in lines:
-        m = proj_re.match(line.rstrip())
-        if not m:
-            continue
-        path_str = m.group(1).replace('\\"', '"').replace("\\\\", "\\")
-        if not Path(path_str).exists():
-            stale_paths.add(path_str)
-
-    if not stale_paths:
-        return
-
-    # Second pass: filter out stale sections and rewrite
-    kept: list[str] = []
-    skip = False
-    for line in lines:
-        stripped = line.rstrip()
-        m = proj_re.match(stripped)
-        if m:
-            path_str = m.group(1).replace('\\"', '"').replace("\\\\", "\\")
-            if path_str in stale_paths:
-                skip = True
-                continue
-            else:
-                skip = False
-                kept.append(line)
-                continue
-        if skip:
-            if section_start_re.match(stripped):
-                skip = False
-                kept.append(line)
-            continue
-        kept.append(line)
-
-    tmp = config_path.with_suffix(config_path.suffix + ".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            f.writelines(kept)
-        os.replace(tmp, config_path)
-    except OSError:
-        if tmp.exists():
-            tmp.unlink()
 
 # 用户家目录的上级前缀：macOS 是 /Users，Linux 是 /home
 HOME_PREFIX = str(HOME.parent)
@@ -289,12 +229,26 @@ def scan_antigravity() -> dict:
     grouped: dict[str, list] = {}
     live_uuids: set[str] = set()
 
+    # 构建 annotation 存在集合：annotations/*.pbtxt 是 UI 是否显示的可靠信号。
+    # 索引里有但 annotation 不存在 → 索引残留（UI 里看不到）。
+    annot_uuids: set[str] = set()
+    if annot_dir.exists():
+        for a in annot_dir.glob("*.pbtxt"):
+            if _is_uuid(a.stem):
+                annot_uuids.add(a.stem)
+
+    stale_index_group = "(索引残留：侧栏已不可见)"
+
     # 1) 侧栏索引（新版权威数据源）。按 workspace 分组，对齐 app 里的项目语义。
+    #    索引里有但 annotation 没有的，归到"索引残留"分组，不跟正常会话混在一起。
     for e in agyhub_summaries.list_entries(index_pb):
         live_uuids.add(e["id"])
-        project = e["workspace"] or "(未分组对话)"
+        has_annot = e["id"] in annot_uuids
+        project = (e["workspace"] or "(未分组对话)") if has_annot else stale_index_group
         # 索引条目自身字节 + 仍在的 conversation/brain/annotation 文件体积
+        # 新版 Antigravity 用 SQLite .db 存对话正文（旧版是 .pb），两个都算。
         size = (e["size"] + dir_size(conv_dir / f"{e['id']}.pb")
+                + dir_size(conv_dir / f"{e['id']}.db")
                 + dir_size(annot_dir / f"{e['id']}.pbtxt") + dir_size(brain_dir / e["id"]))
         grouped.setdefault(project, []).append({
             "id": e["id"],
@@ -302,7 +256,7 @@ def scan_antigravity() -> dict:
             "snippet": "",
             "mtime": e["mtime"] or mtime_of(conv_dir / f"{e['id']}.pb"),
             "size": size,
-            "extra": {"in_index": True},
+            "extra": {"in_index": True, "index_stale": not has_annot},
         })
 
     # 2) 兼容旧版/未迁移：conversations/*.pb 中不在索引里的，补进来
@@ -326,9 +280,31 @@ def scan_antigravity() -> dict:
             "extra": {},
         })
 
+    # 2b) 新版 .db 对话文件中不在索引里的残留也补进来（当作孤儿/残留）
+    for db in sorted(conv_dir.glob("*.db"), key=mtime_of, reverse=True):
+        uuid = db.stem
+        if uuid in live_uuids:
+            continue
+        live_uuids.add(uuid)
+        brain = brain_dir / uuid
+        annot = annot_dir / f"{uuid}.pbtxt"
+        size = dir_size(db) + dir_size(annot) + dir_size(brain)
+        # .db 文件没有现成的标题/摘要接口，标为"残留对话数据库"
+        grouped.setdefault("(未分组对话)", []).append({
+            "id": uuid,
+            "title": "(残留对话 DB：索引中不存在)",
+            "snippet": "",
+            "mtime": mtime_of(db),
+            "size": size,
+            "extra": {"orphan_kind": "db_not_in_index"},
+        })
+
     for project, sessions in grouped.items():
         real = project if project.startswith("/") else ""
         orphan = bool(real) and not Path(real).exists()
+        # 索引残留分组整体视为孤儿项目
+        if project == stale_index_group:
+            orphan = True
         agent["projects"].append(_make_project(
             pid=project, label=project, real_path=real,
             orphan=orphan, sessions=sessions,
@@ -383,6 +359,56 @@ def _antigravity_snippet(transcript: Path) -> str:
 
 # ─────────────────────────── Claude Code ───────────────────────────
 
+TEMP_SKILL_RUNTIME_RE = re.compile(
+    r"/_skill-runtime/releases/[0-9a-fA-F]{64}/runner/?$"
+)
+
+
+def _claude_jsonl_cwd(jsonl: Path) -> str | None:
+    counts: Counter[str] = Counter()
+    try:
+        with jsonl.open(encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = d.get("cwd")
+                if isinstance(cwd, str) and cwd.strip():
+                    counts[cwd.strip()] += 1
+    except OSError:
+        return None
+    if not counts:
+        return None
+    return min(counts, key=lambda path: (-counts[path], path))
+
+
+def _path_exists(path: str) -> bool:
+    try:
+        return Path(path).exists()
+    except OSError:
+        return False
+
+
+def _choose_claude_project_path(paths: list[str]) -> str:
+    counts = Counter(path for path in paths if path)
+    if not counts:
+        return ""
+    return min(
+        counts,
+        key=lambda path: (not _path_exists(path), -counts[path], path),
+    )
+
+
+def _claude_orphan_reason(paths: list[str], orphan: bool) -> str | None:
+    if not orphan:
+        return None
+    known = [path for path in paths if path]
+    if known and all(TEMP_SKILL_RUNTIME_RE.search(path) for path in known):
+        return "temporary_skill_runtime"
+    return "missing_workdir"
+
+
 def scan_claude() -> dict:
     root = HOME / ".claude"
     projects_dir = root / "projects"
@@ -398,7 +424,7 @@ def scan_claude() -> dict:
     if not agent["installed"]:
         return agent
 
-    # sessionId -> 真实项目路径（history.jsonl 最权威，目录名编码不可逆）
+    # sessionId -> history 记录的项目路径；session JSONL 自带 cwd 时优先使用
     sid_to_project = _claude_history_projects(history)
 
     for pdir in sorted(projects_dir.iterdir()):
@@ -415,7 +441,7 @@ def scan_claude() -> dict:
             label_path = resolved or _decode_claude(pdir.name)
             label_suffix = "（空/孤儿目录）" if is_orphan else "（空目录）"
             title_suffix = "（无会话文件的孤儿项目目录）" if is_orphan else "（无会话文件的项目目录）"
-            agent["projects"].append(_make_project(
+            project = _make_project(
                 pid=pdir.name, label=label_path + label_suffix,
                 real_path=resolved or "", orphan=is_orphan,
                 sessions=[{
@@ -423,14 +449,19 @@ def scan_claude() -> dict:
                     "snippet": "", "mtime": mtime_of(pdir), "size": dir_size(pdir),
                     "extra": {"claude_kind": "orphan_dir"},
                 }],
-            ))
+            )
+            project["orphan_reason"] = "missing_workdir" if is_orphan else None
+            agent["projects"].append(project)
             continue
 
         sessions = []
-        real_path = ""
+        project_paths = []
+        fallback_path = _resolve_claude_path(pdir.name)
         for f in jsonls:
             sid = f.stem
-            real_path = real_path or sid_to_project.get(sid, "")
+            session_path = _claude_jsonl_cwd(f) or sid_to_project.get(sid, "") or fallback_path
+            if session_path:
+                project_paths.append(session_path)
             size = dir_size(f) + dir_size(pdir / sid)
             size += dir_size(root / "file-history" / sid)
             size += dir_size(root / "session-env" / sid)
@@ -444,12 +475,14 @@ def scan_claude() -> dict:
                 "size": size,
                 "extra": {"claude_kind": "session"},
             })
-        real_path = real_path or _resolve_claude_path(pdir.name)
-        orphan = bool(real_path) and not Path(real_path).exists()
-        agent["projects"].append(_make_project(
+        real_path = _choose_claude_project_path(project_paths) or fallback_path
+        orphan = bool(project_paths) and not any(_path_exists(path) for path in project_paths)
+        project = _make_project(
             pid=pdir.name, label=real_path or pdir.name,
             real_path=real_path, orphan=orphan, sessions=sessions,
-        ))
+        )
+        project["orphan_reason"] = _claude_orphan_reason(project_paths, orphan)
+        agent["projects"].append(project)
     _enrich_multica_sessions(agent)
     _finalize_agent(agent)
     return agent
@@ -855,9 +888,11 @@ def _enrich_multica_sessions(agent: dict) -> None:
             project["label"] = f"~/multica_workspaces/{workspace_id}/{task_id_full}"
             project["real_path"] = str(task_dir)
             project["orphan"] = False  # task dir exists → not orphaned
+            project["orphan_reason"] = None
         else:
             project["label"] = f"~/multica_workspaces/{workspace_id}/{task_prefix}…（任务目录已清理）"
             project["orphan"] = True  # task dir gone → truly orphaned
+            project["orphan_reason"] = "missing_workdir"
 
         # Enrich sessions
         for session in project["sessions"]:
@@ -912,6 +947,19 @@ def _finalize_agent(agent: dict) -> None:
 
 
 def main() -> int:
+    # 支持 --json-out <path>：JSON 直接写文件，避免 stdout/stderr 混叠导致
+    # 下游解析失败（bash 重定向、run.sh 包装等场景都可能混进去）。
+    # 未指定时仍输出到 stdout（兼容旧用法）。
+    json_out_path: str | None = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--json-out" and i + 1 < len(args):
+            json_out_path = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
     start = time.time()
     agents = [scan_codex(), scan_antigravity(), scan_claude()]
     out = {
@@ -931,9 +979,19 @@ def main() -> int:
         f"size={total_size} in {out['scan_seconds']}s",
         file=sys.stderr,
     )
-    # 空态快通道：JSON 写到 stdout 后，再多打一行友好提示，
+
+    # 写 JSON：优先写文件（最稳健），否则写 stdout
+    json_text = json.dumps(out, ensure_ascii=False)
+    if json_out_path:
+        with open(json_out_path, "w", encoding="utf-8") as f:
+            f.write(json_text)
+        print(f"[scan] JSON 已写入: {json_out_path}", file=sys.stderr)
+    else:
+        sys.stdout.write(json_text)
+        sys.stdout.flush()
+
+    # 空态快通道：JSON 写完后，再多打一行友好提示到 stderr，
     # 让 agent 看到一眼就能决定"无需起服务"。
-    json.dump(out, sys.stdout, ensure_ascii=False)
     if total_sessions == 0 and total_orphans == 0:
         print("", file=sys.stderr)  # 分隔上一行
         print(

@@ -178,7 +178,7 @@ function renderLead(){
   const lead=document.getElementById("lead");
   if(!max){ lead.style.display="none"; return; }
   lead.innerHTML = `占用最大的是 <b>${max.name}</b>（${fmt(max.total_size)} / ${max.session_count} 个会话）。`
-    + (orphans? ` 三个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个会话所属的工作目录已不存在，建议优先清理。` : "");
+    + (orphans? ` 三个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个孤儿会话，建议优先检查和清理。` : "");
 }
 
 function renderOverview(){
@@ -203,7 +203,7 @@ function renderTotals(){
   const multicaActive=installed().reduce((s,a)=>s+(a.multica_active_count||0),0);
   ts.innerHTML=`<div><div class="k">合计占用</div><div class="v">${fmt(size)}</div></div>
     <div><div class="k">合计会话</div><div class="v">${sess}</div></div>
-    <div><div class="k">孤儿会话（工作目录已删除）</div><div class="v" style="color:var(--orange)">${orph}</div></div>
+    <div><div class="k">孤儿会话</div><div class="v" style="color:var(--orange)">${orph}</div></div>
     ${multicaCleanable?`<div><div class="k">Multica 可清理</div><div class="v" style="color:var(--accent)">${multicaCleanable}</div></div>`:""}
     ${multicaActive?`<div><div class="k">Multica 不建议清理</div><div class="v" style="color:var(--orange)">${multicaActive}</div></div>`:""}`;
 }
@@ -247,7 +247,10 @@ function renderSections(){
 function projectEl(a, pi){
   const p=a.projects[pi];
   const det=el(`<details class="proj"></details>`);
-  const orphan = p.orphan? `<span class="badge orphan">⚠ 工作目录已删除</span>`:"";
+  const orphanText = p.orphan_reason === "temporary_skill_runtime"
+    ? "⚠ 临时 Skill 运行目录已清理"
+    : "⚠ 工作目录已删除";
+  const orphan = p.orphan? `<span class="badge orphan">${orphanText}</span>`:"";
   const hasMultica = p.sessions.some(s=>s.extra&&s.extra.multica);
   const multicaBadge = hasMultica
     ? (p.multica_status === "active"

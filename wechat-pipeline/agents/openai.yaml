@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信公众号 Stage Runner"
+  short_description: "使用独立 Agent 分阶段执行、验收并创建微信公众号草稿"
+  default_prompt: "使用 $wechat-pipeline 通过独立 Stage Agent 完成这篇文章，并在全部回执验收通过后创建微信公众号草稿。"

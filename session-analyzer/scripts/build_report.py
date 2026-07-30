@@ -13,6 +13,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cleanup_claude_config  # noqa: E402
+
 # HTML template (relative to this file: ../assets/report_template.html).
 TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "report_template.html"
 
@@ -35,6 +38,9 @@ def main():
         print(__doc__)
         sys.exit(1)
     src = sys.argv[1]
+    if not cleanup_claude_config.verify_cleanup_marker(Path(src)):
+        print("报告已阻止：Claude 配置清理未成功完成。", file=sys.stderr)
+        sys.exit(1)
     out = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(
         "~/Desktop/session-report.html")
 

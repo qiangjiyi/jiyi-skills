@@ -80,6 +80,7 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(project["id"], encoded)
             self.assertEqual(project["label"], deleted_cwd)
             self.assertEqual(project["real_path"], deleted_cwd)
+            self.assertEqual(project["sessions"][0]["extra"]["cwd"], deleted_cwd)
             self.assertTrue(project["orphan"])
             self.assertEqual(project["orphan_reason"], "missing_workdir")
 
@@ -100,6 +101,7 @@ class ScanTest(unittest.TestCase):
 
             project = self.scan_claude(home)["projects"][0]
             self.assertEqual(project["real_path"], str(history_cwd))
+            self.assertEqual(project["sessions"][0]["extra"]["cwd"], str(history_cwd))
             self.assertFalse(project["orphan"])
             self.assertIsNone(project["orphan_reason"])
 
@@ -154,8 +156,22 @@ class ScanTest(unittest.TestCase):
 
             project = self.scan_claude(home)["projects"][0]
             self.assertEqual(project["real_path"], str(existing))
+            self.assertEqual(
+                {session["extra"]["cwd"] for session in project["sessions"]},
+                {str(existing), str(deleted)},
+            )
             self.assertFalse(project["orphan"])
             self.assertIsNone(project["orphan_reason"])
+
+    def test_empty_project_synthetic_session_has_no_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            encoded = "-missing-empty-project"
+            (home / ".claude" / "projects" / encoded).mkdir(parents=True)
+
+            session = self.scan_claude(home)["projects"][0]["sessions"][0]
+            self.assertEqual(session["extra"]["claude_kind"], "orphan_dir")
+            self.assertNotIn("cwd", session["extra"])
 
     def test_project_path_choice_uses_frequency_then_lexical_order(self) -> None:
         with mock.patch.object(scan, "_path_exists", return_value=False):
@@ -167,6 +183,25 @@ class ScanTest(unittest.TestCase):
                 scan._choose_claude_project_path(["/z", "/a"]),
                 "/a",
             )
+
+    def test_json_out_is_private_and_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scan.json"
+            with mock.patch.object(scan, "scan_codex", return_value={
+                "key": "codex", "installed": False, "session_count": 0,
+                "orphan_session_count": 0, "total_size": 0,
+            }), mock.patch.object(scan, "scan_antigravity", return_value={
+                "key": "antigravity", "installed": False, "session_count": 0,
+                "orphan_session_count": 0, "total_size": 0,
+            }), mock.patch.object(scan, "scan_claude", return_value={
+                "key": "claude", "installed": False, "session_count": 0,
+                "orphan_session_count": 0, "total_size": 0,
+            }), mock.patch.object(sys, "argv", ["scan.py", "--json-out", str(path)]):
+                self.assertEqual(scan.main(), 0)
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text())["home"], str(scan.HOME))
+            self.assertEqual(list(Path(tmp).glob(".scan.json.*")), [])
 
     def test_scan_codex_does_not_modify_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

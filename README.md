@@ -45,7 +45,8 @@ jiyi-skills/
 
 **它能做什么**
 
-- 🔍 **只读扫描**：`os.scandir` / `stat` / 只读 SQLite SELECT / 读 jsonl，全程绝不写盘。
+- 🔍 **只读扫描**：`os.scandir` / `stat` / 只读 SQLite SELECT / 读 jsonl，不修改任何 Agent 数据源；扫描快照以 `0600` 权限原子写入。
+- 🧹 **配置同步**：依据最新 Claude Code session 分布，安全清理 `~/.claude.json` 中无真实会话的项目配置。
 - 📊 **三级统计**：按「Agent → 项目 → 会话」分层统计占用空间与会话数量。
 - 🧭 **孤儿识别**：标记工作目录已删除、却仍残留会话的孤儿项目。
 - 🖥️ **网页对比**：本地起服务（`127.0.0.1` + 随机端口 + 随机 token），三栏直观对比三个 Agent。
@@ -57,10 +58,13 @@ jiyi-skills/
 ```bash
 cd session-analyzer
 
-# 1. 只读扫描 → JSON
-bash scripts/run.sh scan.py > /tmp/session_scan.json
+# 1. 只读扫描 → 私有 JSON 快照
+bash scripts/run.sh scan.py --json-out /tmp/session_scan.json
 
-# 2. 起本地服务看报告 / 在网页上清理（Ctrl+C 停）
+# 2. 清理无真实会话的 Claude 全局项目配置
+bash scripts/run.sh cleanup_claude_config.py /tmp/session_scan.json
+
+# 3. 起本地服务看报告 / 在网页上清理（Ctrl+C 停）
 bash scripts/run.sh server.py /tmp/session_scan.json
 
 # 可选：导出一份只读静态报告

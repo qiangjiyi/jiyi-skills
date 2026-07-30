@@ -34,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delete  # noqa: E402
+import cleanup_claude_config  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "..", "assets", "report_template.html")
@@ -287,6 +288,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
+        sys.exit(1)
+    if not cleanup_claude_config.verify_cleanup_marker(Path(sys.argv[1])):
+        print("服务已阻止：Claude 配置清理未成功完成。", file=sys.stderr)
         sys.exit(1)
     global DATA, TPL, INDEX
     DATA, TPL, INDEX = load(sys.argv[1])

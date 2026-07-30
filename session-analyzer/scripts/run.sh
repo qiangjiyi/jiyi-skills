@@ -9,6 +9,7 @@
 #
 # Usage:
 #   bash scripts/run.sh scan.py > /tmp/session_scan.json
+#   bash scripts/run.sh cleanup_claude_config.py /tmp/session_scan.json
 #   bash scripts/run.sh close_agents.py
 #   bash scripts/run.sh precleanup.py
 #   bash scripts/run.sh server.py /tmp/session_scan.json

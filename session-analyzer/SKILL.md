@@ -15,7 +15,7 @@ description: >
 # Session Analyzer
 
 对本机三个 AI Agent（Codex / Antigravity / Claude Code）的会话数据做一次只读分析，
-生成交互式 HTML 报告，并可在网页上一键删除。**确定性管线：先只读扫描 → 固定决策 → 固定执行**
+依据扫描快照同步清理 `~/.claude.json` 中没有真实 session 的项目配置，再生成交互式 HTML 报告并可在网页上一键删除。**确定性管线：只读扫描 → Claude 配置清理 → 固定决策 → 固定执行**
 （关 app / 兜底清理 / 报告形态都按写死的默认值跑，不再用 AskUserQuestion 询问；仅当用户主动要求偏离时才调整对应项）。
 
 与 storage-analyzer 同构：**一个模板 + 两个入口**。模板 `report_template.html` 看注入的
@@ -25,10 +25,18 @@ description: >
 
 ## 铁律
 
-- **扫描只读。** `scan.py` 只做 `os.scandir`/`stat`/只读 SQLite SELECT/读 jsonl，绝不写盘，
-  也不自动清理 Codex 项目配置。删除只发生在 `server.py`（经 `agent_delete.py`），且只删扫描里
-  出现过的会话/项目。唯一的例外是扫描**之前**的 `precleanup.py`：它清空目录/卫星孤儿
-  （默认废纸篓、可逆），但 `scan.py` 本身仍严格只读。
+- **扫描只读，配置清理独立。** `scan.py` 只做 `os.scandir`/`stat`/只读 SQLite SELECT/读 jsonl，
+  绝不修改任何 Agent 数据源；`--json-out` 仅写调用方指定的扫描产物。扫描之后由独立的
+  `cleanup_claude_config.py` 只过滤 `~/.claude.json` 顶层 `projects`，不属于
+  `precleanup.py` 或 `agent_delete.prune_roots()`。会话删除仍只发生在 `server.py`（经
+  `agent_delete.py`），且只删扫描里出现过的会话/项目。
+- **Claude 配置清理 fail closed。** 只以真实 Claude session 的 `extra.cwd` 并集判活；
+  `extra.claude_kind == "orphan_dir"` 不算 session，目录仍存在也不保留配置。扫描快照以 `0600`
+  原子写入，清理前和提交前都复核实时 `(project_id, session_id, cwd)` 分布与快照完全一致。配置清理
+  仅保留最近一次修改前的固定整文件备份，权限 `0600`；检测到 session 分布变化、快照/配置结构
+  异常、并发变化、备份或原子替换失败时立即停止。静态报告和本地服务还会校验同时绑定扫描摘要、
+  当前 HOME 和清理后配置摘要的 `0600` 成功标记；清理未成功、配置又发生变化或快照/标记来自其他
+  HOME 时都无法启动。日志和摘要只报状态/数量，不输出项目键、OAuth、account、MCP 等配置内容。
 - **清理范围收死。** 空目录/孤儿清理只在各 Agent 自己的数据子树内自底向上进行
   （`agent_delete.prune_roots()` 列出的根），绝不删根本身、绝不越界——空目录有时是程序占位。
   判空时忽略 `.DS_Store`/`Thumbs.db`，否则只剩系统垃圾文件的目录会"扫了还删不干净"。
@@ -42,12 +50,15 @@ description: >
 
 ## 执行流程
 
-**确定性管线，三段式：先扫描 → 固定决策 → 固定执行。** 全程无 act-vs-ask 分支：开场永远先
-只读扫描（不问、不可选）；扫到东西就按**写死的默认决策**直接往下跑，**不再用 AskUserQuestion
-询问**。默认决策恒为：① 关闭 ChatGPT（含 Codex）/ Antigravity，② 开场兜底清理，③ 生成可删除交互报告——
-三项全做。**禁止**把关 app、兜底清理、报告形态当成可选项临场询问或边走边拍——那正是流程每次跑
-都漂移的根源。**唯一的偏离来源**：用户在对话里主动提出（如「别关 app」「只要只读静态报告」
-「都不要，只看摘要」）时，才按用户所说调整对应项；用户没说就一律走默认、不主动反问。
+**确定性管线，四段式：只读扫描 → Claude 配置清理 → 固定决策 → 固定执行。** 全程无
+act-vs-ask 分支：开场永远先只读扫描，随后必须清理 `~/.claude.json` 的陈旧项目配置；两步均
+不问、不可选。配置清理成功且扫到会话/孤儿时，按**写死的默认决策**直接往下跑，**不再用
+AskUserQuestion 询问**。默认决策恒为：① 关闭 ChatGPT（含 Codex）/ Antigravity，② 开场兜底
+清理，③ 生成可删除交互报告——三项全做。**禁止**把关 app、兜底清理、报告形态当成可选项
+临场询问或边走边拍——那正是流程每次跑都漂移的根源。**唯一的偏离来源**：用户在对话里主动
+提出（如「别关 app」「只要只读静态报告」「都不要，只看摘要」）时，才按用户所说调整对应项；
+用户没说就一律走默认、不主动反问。Claude 配置清理属于固定的扫描后维护步骤，不因报告形态改变
+而跳过。
 
 ### Step 1 始终先做：只读扫描（不问、不可选）
 
@@ -55,8 +66,9 @@ description: >
 bash scripts/run.sh scan.py --json-out /tmp/session_scan.json
 ```
 
-> **推荐用 `--json-out` 写文件**（而不是 `>` 重定向）：彻底避免 stdout/stderr 混叠
-> 导致 JSON 解析失败。重定向写法仍可用，但依赖调用方正确分离 stderr。
+> **推荐用 `--json-out` 写文件**（而不是 `>` 重定向）：快照通过同目录临时文件以 `0600`
+> 权限原子写入，既避免 stdout/stderr 混叠导致 JSON 解析失败，也避免 `/tmp` 中的 cwd、摘要等
+> 会话信息被其他本地用户读取。重定向写法仍可用，但调用方必须自行保证输出分离和文件权限。
 
 > **为什么用 `run.sh` 而不是 `python3 scripts/scan.py`：** agent 的 cwd 是当前项目目录
 > （如 `/Users/jiyi/Projects/active/<proj>`），不是 skill 根。直接用相对路径会
@@ -68,18 +80,21 @@ JSON：每个 Agent → 项目 → 会话三级，含每层 size、会话数、m
 
 `scan.py` 在 stderr 还会打一行自检 `[scan] agents=N sessions=... orphans=... size=...
 in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行稳定输出 `✓ DONE`。
-**空态快通道**：若 `sessions == 0 && orphans == 0`，stderr 多打一行
-`✓ 本机 AI 会话状态干净（0 会话 / 0 孤儿），无需清理。`——此时**直接跳到 Step S 给摘要就结束**，
-不问决策、不生成报告。
+扫描结束后无论是否为空态，都必须先执行 Step 1.5；**空态快通道**只能发生在配置清理成功之后。
+若 `sessions == 0 && orphans == 0`，stderr 多打一行
+`✓ 本机 AI 会话状态干净（0 会话 / 0 孤儿），无需清理。`——完成 Step 1.5 后直接跳到 Step S，
+不问决策、不关闭 app、不跑 `precleanup.py`、不生成报告。
 
 各 Agent 的会话/项目定义：
 - **Codex**（`~/.codex/`）：会话 = `state_5.sqlite` 的 `threads` 行（含 `unknown` 等所有 source）；项目按 `cwd` 聚合。
 - **Antigravity**（`~/.gemini/antigravity/`）：新版会话 = 侧栏索引 `agyhub_summaries_proto.pb` 里的每条记录（id/标题/时间/workspace 均解析自该 proto），按 workspace 路径归类成项目；兼容旧版未迁移时残留的 `conversations/<uuid>.pb`；无对应对话的 brain 目录单列「孤儿残留」。
 - **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该编码目录。
   真实路径按「session JSONL 顶层 `cwd` → `history.jsonl` 的 project → 编码目录启发式解码」取值；
-  JSONL cwd 即使已不存在仍是权威来源，不继续回退。编码 `project.id` 始终作为删除身份，
-  `label`/`real_path` 只用于展示和孤儿判断。匹配 `/_skill-runtime/releases/<digest>/runner`
-  的已清理临时目录会标记为「临时 Skill 运行目录已清理」；0-jsonl 的空目录单列为「空/孤儿目录」。
+  JSONL cwd 即使已不存在仍是权威来源，不继续回退。每个真实 session 都把该路径写入
+  `extra.cwd`；同一编码目录可包含多个不同 cwd，配置清理取所有 session cwd 的并集，不能只看
+  项目级 `real_path`。编码 `project.id` 始终作为删除身份，`label`/`real_path` 只用于展示和孤儿
+  判断。匹配 `/_skill-runtime/releases/<digest>/runner` 的已清理临时目录会标记为「临时 Skill
+  运行目录已清理」；0-jsonl 的空目录单列为 `extra.claude_kind = "orphan_dir"`，不算真实 session。
 
 **Multica 增强**：当 Claude Code 的项目目录匹配 Multica workspace 模式（`*multica-workspaces-<ws_id>-<task_prefix>-workdir`）时，scan.py 自动：
 1. 查找对应的 `~/multica_workspaces/<ws_id>/<task_id>/` 目录，读取 `.gc_meta.json` 判断任务完成状态
@@ -108,6 +123,32 @@ API 调用方式：
 - Claude 分区新增「🧹 一键清理 N 个 Multica 可清理会话」按钮（仅 cleanable）
 - 摘要区新增 Multica 可清理/不建议清理计数
 - 删除 Multica 会话时，自动同时清理 workspace 任务目录和 CLI 缓存
+
+### Step 1.5 固定执行：清理 Claude 全局项目配置（不问、不可选）
+
+```bash
+bash scripts/run.sh cleanup_claude_config.py /tmp/session_scan.json
+```
+
+`cleanup_claude_config.py` 先校验扫描快照属于当前 HOME、是当前用户拥有的普通 `0600` 文件，再根据
+其中 `extra.claude_kind == "session"` 的 `(project.id, session.id, extra.cwd)` 集合过滤
+`~/.claude.json` 顶层 `projects`：没有任何真实 session 的项目配置全部删除，**即使对应工作目录仍
+存在也删除**；其他顶层键和保留项目值完整保留。清理前和提交前会重新读取 `~/.claude/projects`
+及 `history.jsonl`，实时 session 身份/cwd 与快照有任何增删或变化就以 `session_state_changed` 停止，
+要求重新运行 Step 1。实际删除前将原文件完整备份到固定的
+`~/.claude.json.session-analyzer.bak`（`0600`），每次覆盖最近一次备份，不无限增长；发生冲突时不会
+覆盖既有备份。
+
+Claude Code 没有公开可复用的 `~/.claude.json` 锁协议，因此脚本采用实时 session 复核、配置写前
+重读、同目录临时文件和 `os.replace` 原子替换；这能拒绝可检测的并发更新并避免半写，但无法彻底
+消除最后一次检查与 replace 之间的极短无锁竞态。检测到 `session_state_changed`、快照/配置异常、
+并发变化、备份或替换失败时退出非零，**必须立即停止整个管线**：保留 `/tmp/session_scan.json`，
+不关闭 app、不跑 `precleanup.py`、不生成静态或交互报告；报告入口本身也会拒绝缺少成功标记或标记
+与快照摘要不匹配的请求。只向用户报告脚本输出的通用失败类别并建议从 Step 1 重试，不显示异常
+原文或配置内容。配置不存在、没有待删项均是成功 no-op，仍会生成绑定该快照的 `0600` 成功标记。
+
+成功后转述 `removed=N` 和 `backup=created`（若有），但绝不转述项目键或配置值。然后才判断空态：
+空态直达 Step S；非空态进入 Step 2。
 
 ### Step 2 固定决策（扫到东西直接按默认执行，不询问）
 
@@ -200,8 +241,9 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
 
 ### Step S 对话里给摘要
 
-报告生成后（或空态快通道直达此处），在对话里给结论先行的一段话：三个 Agent 合计占用、
-占用最大的 Agent、孤儿会话总数、最该先关注的项。细节让用户看 HTML。
+报告生成后（或配置清理成功后由空态快通道直达此处），在对话里给结论先行的一段话：三个 Agent
+合计占用、占用最大的 Agent、孤儿会话总数、最该先关注的项，以及 Claude 配置清理删除条目数和
+是否创建备份。细节让用户看 HTML；摘要不得展示任何 `~/.claude.json` 项目键或值。
 
 **扫描 JSON 结构**（读它做摘要时照此取值，别猜——`agents` 是 **list** 不是 dict，对它用
 `.items()` 会报错）：
@@ -233,6 +275,8 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
           "sessions": [            // ← list
             { "id": "...", "title": "...", "snippet": "...",
               "mtime": 0, "size": 0, "extra": {
+                "claude_kind": "session", // 真实 Claude session；0-jsonl 合成项为 orphan_dir
+                "cwd": "/path/from/jsonl-or-history-or-fallback", // 仅真实 Claude session
                 "multica": {            // 仅 Multica 会话
                   "workspace_id": "...", "task_id": "...",
                   "task_prefix": "...", "status": "cleanable",  // cleanable | active
@@ -267,14 +311,17 @@ session-analyzer/
 ├── SKILL.md
 ├── scripts/
 │   ├── scan.py                    # 只读扫描三 Agent → JSON
-│   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（Step 2 选了才跑）
+│   ├── cleanup_claude_config.py   # 扫描后过滤 ~/.claude.json 顶层 projects
+│   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（默认执行）
 │   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）
 │   ├── agyhub_summaries.py        # Antigravity 索引 .pb 解析 + 按 id 剔除（scan/删除共用）
 │   ├── build_report.py            # 注入 DELETE_CONFIG=null → 静态只读报告（入口一）
 │   ├── server.py                  # 本地服务，注入启用态配置 → 带删除的交互报告（入口二）
 │   └── agent_delete.py            # 各 Agent 的删除处理器（server.py 调用）
 ├── tests/
-│   └── test_scan.py               # Claude cwd/orphan + Codex 扫描只读回归测试
+│   ├── test_scan.py               # Claude cwd/orphan + 快照权限 + Codex 只读回归测试
+│   ├── test_cleanup_claude_config.py # 配置清理安全、session 竞态和备份测试
+│   └── test_report_gate.py        # 清理成功标记与报告入口闸门测试
 └── assets/
     └── report_template.html       # 报告模板（只读/删除两态，看 __DELETE_CONFIG__ 切换）
 ```

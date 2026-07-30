@@ -17,7 +17,9 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -473,7 +475,7 @@ def scan_claude() -> dict:
                 "snippet": snip,
                 "mtime": mtime_of(f),
                 "size": size,
-                "extra": {"claude_kind": "session"},
+                "extra": {"claude_kind": "session", "cwd": session_path},
             })
         real_path = _choose_claude_project_path(project_paths) or fallback_path
         orphan = bool(project_paths) and not any(_path_exists(path) for path in project_paths)
@@ -946,6 +948,20 @@ def _finalize_agent(agent: dict) -> None:
     )
 
 
+def _write_json_out(path: Path, text: str) -> None:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(name)
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     # 支持 --json-out <path>：JSON 直接写文件，避免 stdout/stderr 混叠导致
     # 下游解析失败（bash 重定向、run.sh 包装等场景都可能混进去）。
@@ -983,8 +999,7 @@ def main() -> int:
     # 写 JSON：优先写文件（最稳健），否则写 stdout
     json_text = json.dumps(out, ensure_ascii=False)
     if json_out_path:
-        with open(json_out_path, "w", encoding="utf-8") as f:
-            f.write(json_text)
+        _write_json_out(Path(json_out_path), json_text)
         print(f"[scan] JSON 已写入: {json_out_path}", file=sys.stderr)
     else:
         sys.stdout.write(json_text)

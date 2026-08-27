@@ -1,0 +1,278 @@
+#!/bin/bash
+# 视频号下载服务（wx_channels_download）
+# 用法:
+#   wx-video [start [--detach]]  启动服务（前台运行，Ctrl+C 退出；--detach 为后台运行）
+#                                 若已在运行，自动停止并重启
+#   wx-video stop                 停止后端，并按「启动前快照」恢复系统代理
+#   wx-video update               检查并安装 GitHub 上的最新版本（安装后如服务原本在运行会自动重启）
+#
+# 代理治理：后端工作时会改写系统 HTTP/HTTPS 代理（指向 127.0.0.1:2023，抓取机制的一部分）。
+# 本脚本在启动前对每个网络服务的 Web/Secure 代理做快照（服务器/端口/开关），停止时原样写回，
+# 保证 Clash 等代理软件的「系统代理」设置不因本工具启停而被破坏（只退化为「关闭」）。
+# SOCKS 等后端不会触碰的项不纳入快照，避免覆盖用户在运行期间的其他更改。
+set -u
+
+BASE="$HOME/.local/share/qiaomu-wx-video/backend"
+CURRENT="$BASE/current"   # 指向当前版本目录的符号链接，update 时只切换它
+SNAPSHOT="$BASE/.proxy-snapshot.tsv"
+BIN="wx_video_download"
+REPO="ltaoo/wx_channels_download"
+# GitHub 访问失败时的代理回退；WX_VIDEO_PROXY 可覆盖（如 http://127.0.0.1:7890）
+PROXY="${WX_VIDEO_PROXY:-http://127.0.0.1:7890}"
+
+backend_dir() {
+  if [ -L "$CURRENT" ]; then
+    readlink "$CURRENT"
+  else
+    ls -d "$BASE"/v* 2>/dev/null | sort | tail -1
+  fi
+}
+
+backend_pids() {
+  pgrep -f "$BIN" 2>/dev/null || true
+}
+
+# ============ 代理快照与恢复 ============
+
+each_service() {
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed 's/^\*//' | grep -v '^$'
+}
+
+# 输出 "enabled(0/1) server port"
+_get_proxy() {
+  local out
+  if [ "$2" = web ]; then out=$(networksetup -getwebproxy "$1" 2>/dev/null)
+  else out=$(networksetup -getsecurewebproxy "$1" 2>/dev/null); fi
+  [ -z "$out" ] && return 1
+  local en=0 srv prt
+  echo "$out" | grep -q '^Enabled: Yes' && en=1
+  srv=$(echo "$out" | sed -n 's/^Server: //p')
+  prt=$(echo "$out" | sed -n 's/^Port: //p')
+  echo "$en $srv $prt"
+}
+
+_set_proxy() { # $1=svc $2=web|secure $3=en $4=srv $5=prt
+  local setcmd statecmd
+  if [ "$2" = web ]; then setcmd=setwebproxy; statecmd=setwebproxystate
+  else setcmd=setsecurewebproxy; statecmd=setsecurewebproxystate; fi
+  if [ -n "$4" ] && [ -n "$5" ]; then networksetup -$setcmd "$1" "$4" "$5" 2>/dev/null; fi
+  if [ "$3" = 1 ]; then networksetup -$statecmd "$1" on 2>/dev/null
+  else networksetup -$statecmd "$1" off 2>/dev/null; fi
+}
+
+snapshot_proxy() {
+  local tmp kind v en srv prt
+  tmp=$(mktemp)
+  each_service | while read -r svc; do
+    for kind in web secure; do
+      v=$(_get_proxy "$svc" "$kind")
+      [ -z "$v" ] && continue
+      # 按空白拆成三列写入（服务名含空格，故整行用制表符分隔五列）
+      read -r en srv prt <<< "$v"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$svc" "$kind" "$en" "$srv" "$prt" >> "$tmp"
+    done
+  done
+  mv "$tmp" "$SNAPSHOT" 2>/dev/null
+}
+
+# 按快照写回；与当前值相同的项跳过；无快照时退化为旧的「关闭 2023 残留」清理
+restore_proxy() {
+  if [ ! -f "$SNAPSHOT" ]; then
+    clear_stale_proxy
+    return 0
+  fi
+  local changed=0 cur
+  while IFS=$'\t' read -r svc kind en srv prt; do
+    [ -z "${svc:-}" ] && continue
+    cur=$(_get_proxy "$svc" "$kind") || continue
+    if [ "$cur" != "$en $srv $prt" ]; then
+      _set_proxy "$svc" "$kind" "$en" "$srv" "$prt"
+      changed=1
+    fi
+  done < "$SNAPSHOT"
+  if [ "$changed" = 1 ]; then
+    echo "已按启动前快照恢复系统代理"
+  else
+    echo "系统代理与启动前快照一致，无需恢复"
+  fi
+  rm -f "$SNAPSHOT"
+}
+
+# 兜底清理（后端不是经本脚本启动、没有快照时）：
+# 若 2023 已无监听但系统 HTTP/HTTPS 代理仍指向它，则关闭。不碰 SOCKS（那是 Clash 的）。
+clear_stale_proxy() {
+  lsof -nP -iTCP:2023 -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  each_service | while read -r svc; do
+    conf="$(networksetup -getwebproxy "$svc" 2>/dev/null; networksetup -getsecurewebproxy "$svc" 2>/dev/null)"
+    if echo "$conf" | grep -q '^Server: 127\.0\.0\.1$' && echo "$conf" | grep -q '^Port: 2023$'; then
+      networksetup -setwebproxystate "$svc" off 2>/dev/null
+      networksetup -setsecurewebproxystate "$svc" off 2>/dev/null
+      echo "已清理网络服务「${svc}」上残留的系统代理"
+    fi
+  done
+}
+
+# ============ 服务生命周期 ============
+
+stop_backend() {
+  local pids
+  pids=$(backend_pids)
+  if [ -z "$pids" ]; then
+    echo "后端未在运行"
+    restore_proxy
+    return 0
+  fi
+  echo "停止后端 (PID: $(echo $pids | tr '\n' ' '))..."
+  kill -INT $pids 2>/dev/null  # SIGINT 等同 Ctrl+C，程序会自行收尾
+  for _ in $(seq 1 12); do [ -z "$(backend_pids)" ] && break; sleep 0.5; done
+  if [ -n "$(backend_pids)" ]; then
+    kill -TERM $(backend_pids) 2>/dev/null
+    for _ in $(seq 1 6); do [ -z "$(backend_pids)" ] && break; sleep 0.5; done
+  fi
+  if [ -n "$(backend_pids)" ]; then
+    kill -KILL $(backend_pids) 2>/dev/null
+    sleep 0.5
+  fi
+  if [ -z "$(backend_pids)" ]; then
+    echo "已停止"
+    restore_proxy
+  else
+    echo "停止失败，请手动检查: pgrep -f $BIN"
+    return 1
+  fi
+}
+
+start_detached() {
+  local d
+  d=$(backend_dir)
+  [ -z "$d" ] && { echo "未找到已安装的后端"; return 1; }
+  snapshot_proxy
+  # start_new_session 让后端进入全新会话/进程组：启动它的终端或脚本被整组杀掉时不受牵连
+  (cd "$d" && /usr/bin/python3 -c 'import subprocess,sys
+f=open("app.log","ab",0)
+subprocess.Popen(["./wx_video_download"], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)')
+  echo "后端已在后台启动，管理页: http://127.0.0.1:2022/ （停止时执行 wx-video stop 会按快照恢复代理）"
+}
+
+# 前台运行：Ctrl+C 退出后立即按快照恢复代理（不再依赖下次 stop 补救）
+run_foreground() {
+  local dir="$1" child rc
+  cd "$dir" || exit 1
+  snapshot_proxy
+  echo "启动中... 下载管理页: http://127.0.0.1:2022/ （进度以这个页面为准）"
+  echo "微信里打开视频号视频 → 等视频开始播放并暂停 → 点下载按钮选清晰度；完成后 Ctrl+C 退出并恢复代理"
+  "./$BIN" &
+  child=$!
+  trap 'kill -INT "$child" 2>/dev/null' INT TERM
+  rc=0
+  while kill -0 "$child" 2>/dev/null; do
+    wait "$child"
+    rc=$?
+  done
+  trap - INT TERM
+  restore_proxy
+  exit "$rc"
+}
+
+do_update() {
+  local dir cur_tag redir tag asset url tmp new_dir cfg was_running
+  dir=$(backend_dir)
+  cur_tag=""
+  if [ -n "$dir" ]; then
+    cur_tag=$(sed -n 's/.*"tag": *"\([^"]*\)".*/\1/p' "$dir/.qiaomu-install.json" 2>/dev/null | head -1)
+    [ -z "$cur_tag" ] && cur_tag=$(basename "$dir")
+  fi
+
+  echo "检查 $REPO 最新版本..."
+  # 用 releases/latest 的 302 重定向取最新 tag（GitHub 匿名 API 有每小时限流，容易 403）
+  redir=$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 20 "https://github.com/$REPO/releases/latest" 2>/dev/null) || \
+  redir=$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 20 -x "$PROXY" "https://github.com/$REPO/releases/latest" 2>/dev/null)
+  tag=${WX_VIDEO_FORCE_TAG:-$(printf '%s' "$redir" | sed -n 's#.*/releases/tag/\(v[^/?#]*\).*#\1#p')}
+  if [ -z "$tag" ]; then
+    echo "无法获取最新版本号（GitHub 访问失败）"
+    return 1
+  fi
+  if [ -n "$cur_tag" ] && [ "$tag" = "$cur_tag" ] && [ -z "${WX_VIDEO_FORCE_TAG:-}" ]; then
+    echo "当前已是最新版本 ${cur_tag}"
+    return 0
+  fi
+  if [ -z "$cur_tag" ]; then
+    echo "未检测到已安装的后端，将全新安装 ${tag}（约 17MB，来自官方 Release）"
+  else
+    echo "发现新版本: ${tag}（当前: ${cur_tag}）"
+  fi
+
+  case "$(uname -m)" in
+    arm64) asset="wx_video_download_${tag}_darwin_arm64.zip" ;;
+    *)     asset="wx_video_download_${tag}_darwin_amd64.zip" ;;
+  esac
+  url="https://github.com/$REPO/releases/download/$tag/$asset"
+  tmp=$(mktemp -d)
+  echo "下载 $url ..."
+  if ! curl -fL --connect-timeout 20 -o "$tmp/$asset" "$url" 2>/dev/null; then
+    curl -fL --connect-timeout 20 -x "$PROXY" -o "$tmp/$asset" "$url" 2>/dev/null || {
+      echo "下载失败（可设置 WX_VIDEO_PROXY 指向本机代理后重试）"; rm -rf "$tmp"; return 1
+    }
+  fi
+
+  was_running=0
+  [ -n "$(backend_pids)" ] && was_running=1
+  [ "$was_running" = 1 ] && stop_backend
+
+  # 备份现有配置，解压新版后覆盖回去，保留用户设置（如 upstreamProxy）
+  cfg=""
+  [ -f "$dir/config.yaml" ] && cfg=$(mktemp) && cp "$dir/config.yaml" "$cfg"
+
+  new_dir="$BASE/$tag"
+  mkdir -p "$new_dir"
+  unzip -oq "$tmp/$asset" -d "$new_dir"
+  [ -n "$cfg" ] && cp "$cfg" "$new_dir/config.yaml" && rm -f "$cfg"
+
+  printf '{\n  "tag": "%s",\n  "platform": "darwin-%s",\n  "asset": "%s",\n  "archive_sha256": "%s",\n  "source": "%s"\n}\n' \
+    "$tag" "$(uname -m)" "$asset" "$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')" "$url" > "$new_dir/.qiaomu-install.json"
+
+  ln -sfn "$new_dir" "$CURRENT"
+  rm -rf "$tmp"
+  find "$BASE" -maxdepth 1 -type d -name 'v*' ! -name "$tag" -exec rm -rf {} + 2>/dev/null
+  echo "已安装 ${tag}，并清理了旧版本目录"
+
+  [ "$was_running" = 1 ] && start_detached
+  return 0
+}
+
+# ============ 入口 ============
+
+case "${1:-}" in
+  stop)
+    stop_backend
+    ;;
+  update)
+    do_update
+    ;;
+  ""|start|restart)
+    dir=$(backend_dir)
+    [ -z "$dir" ] && { echo "未找到已安装的后端，请先运行: wx-video update"; exit 1; }
+    if [ -n "$(backend_pids)" ]; then
+      echo "检测到后端已在运行，自动重启..."
+      stop_backend
+    fi
+    # 上次异常退出可能留下残留快照（快照文件还在但后端已死）：先恢复原状，再重新快照
+    if [ -f "$SNAPSHOT" ]; then
+      echo "发现上次会话的残留代理快照，先恢复原状..."
+      restore_proxy
+    fi
+    if [ "${2:-}" = "--detach" ]; then
+      start_detached
+    else
+      run_foreground "$dir"
+    fi
+    ;;
+  *)
+    echo "用法: wx-video [start [--detach] | stop | update]"
+    echo "  wx-video (start)       前台启动（已在运行则自动重启），Ctrl+C 退出并恢复代理"
+    echo "  wx-video start --detach 后台启动"
+    echo "  wx-video stop          停止后端并按快照恢复系统代理"
+    echo "  wx-video update        检查并安装最新版本"
+    exit 1
+    ;;
+esac

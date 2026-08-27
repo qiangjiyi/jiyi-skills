@@ -1,20 +1,20 @@
 ---
 name: session-analyzer
 description: >
-  AI Agent 会话分析助手。只读扫描本机 Codex、Antigravity、Claude Code 三个 Agent
-  累积的会话/对话数据，按「Agent → 项目 → 会话」三级层级统计各层占用空间与会话
-  数量，标记工作目录已删除的孤儿会话，生成排版精美的交互式 HTML 报告，并可起
+  AI Agent 会话分析助手。只读扫描本机 Codex、Antigravity、Claude Code、ZCode 四个
+  Agent 累积的会话/对话/任务数据，按「Agent → 项目 → 会话」三级层级统计各层占用空间
+  与会话数量，标记工作目录已删除的孤儿会话，生成排版精美的交互式 HTML 报告，并可起
   本地服务在网页上按会话/按项目一键删除（默认移废纸篓、可逆）。扫描全程只读。
-  务必在以下场景使用：用户说"会话太多""对话记录太多""Codex/Antigravity/Claude
-  会话占空间""AI Agent 历史""项目删了会话还在""孤儿会话""session cleanup"、
+  务必在以下场景使用：用户说"会话太多""对话记录太多""Codex/Antigravity/Claude/
+  ZCode 会话占空间""AI Agent 历史""项目删了会话还在""孤儿会话""session cleanup"、
   想看哪个 Agent 的会话最占地方，或想批量盘点某个项目的会话情况时。
-  注意：本 skill 针对三个 AI Agent 的会话数据，不是整机磁盘分析（那是
+  注意：本 skill 针对四个 AI Agent 的会话数据，不是整机磁盘分析（那是
   storage-analyzer，二者互补）。
 ---
 
 # Session Analyzer
 
-对本机三个 AI Agent（Codex / Antigravity / Claude Code）的会话数据做一次只读分析，
+对本机四个 AI Agent（Codex / Antigravity / Claude Code / ZCode）的会话数据做一次只读分析，
 依据扫描快照同步清理 `~/.claude.json` 中没有真实 session 的项目配置，再生成交互式 HTML 报告并可在网页上一键删除。**确定性管线：只读扫描 → Claude 配置清理 → 固定决策 → 固定执行**
 （关 app / 兜底清理 / 报告形态都按写死的默认值跑，不再用 AskUserQuestion 询问；仅当用户主动要求偏离时才调整对应项）。
 
@@ -43,9 +43,9 @@ description: >
 - **删除安全模型（server.py）。** 绑 127.0.0.1 + 随机端口 + 随机 token；每个 POST 校验
   token + Host（挡 DNS-rebinding）；只接受扫描里存在的 `(agent, scope, project_id, session_id)`，
   客户端无法指定任意路径/id；每个处理器只碰该 Agent 自己的数据目录。
-- **默认移废纸篓（可逆）。** 文件级删除走废纸篓；但 **Codex 的 DB 行 / jsonl 索引行天生硬删**
-  （数据库行没法进废纸篓），Antigravity 侧栏索引 `agyhub_summaries_proto.pb` 同样就地硬改——
-  这些不可逆，UI 已用红色警示并二次确认。
+- **默认移废纸篓（可逆）。** 文件级删除走废纸篓；但 **Codex 与 ZCode 的 DB 行 / jsonl
+  索引行天生硬删**（数据库行没法进废纸篓），Antigravity 侧栏索引 `agyhub_summaries_proto.pb`
+  同样就地硬改——这些不可逆，UI 已用红色警示并二次确认。
 - **路径、命令、thread id 原文展示，不翻译。** 不读取、不展示任何密钥/凭据内容。
 
 ## 执行流程
@@ -75,7 +75,7 @@ bash scripts/run.sh scan.py --json-out /tmp/session_scan.json
 > `can't open file '.../scripts/scan.py'`。`scripts/run.sh` 自定位 skill 根再 exec，
 > 从任何 cwd 都能跑。下面 ① / ② / ③ 同理。
 
-`scan.py` 自动探测三个 Agent 是否安装（数据目录是否存在），未装则跳过并标注。产出统一
+`scan.py` 自动探测四个 Agent 是否安装（数据目录是否存在），未装则跳过并标注。产出统一
 JSON：每个 Agent → 项目 → 会话三级，含每层 size、会话数、mtime、摘要、孤儿标记。
 
 `scan.py` 在 stderr 还会打一行自检 `[scan] agents=N sessions=... orphans=... size=...
@@ -95,6 +95,15 @@ in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行�
   项目级 `real_path`。编码 `project.id` 始终作为删除身份，`label`/`real_path` 只用于展示和孤儿
   判断。匹配 `/_skill-runtime/releases/<digest>/runner` 的已清理临时目录会标记为「临时 Skill
   运行目录已清理」；0-jsonl 的空目录单列为 `extra.claude_kind = "orphan_dir"`，不算真实 session。
+- **ZCode**（`~/.zcode/`）：会话 = `cli/db/db.sqlite` 的 `session` 行（`task_type` 区分
+  interactive / subagent_child 子代理，子代理随父会话级联删除）；项目按 `session.path`
+  （真实工作目录）聚合。对话正文存共享库的 `message`/`part`/`session_entry`（字节计入会话
+  size，删行不缩小 db.sqlite 文件）；任务状态来自 `v2/tasks-index.sqlite` 的 `tasks` 行
+  （task_id 与会话 id 一一对应，删除时同步清行）。逐会话卫星 = `cli/{artifacts,exec,
+  image-cache,agents}/sess_<id>/` 与 `cli/rollout/model-io-sess_<id>.jsonl`；无对应 DB 会话的
+  卫星/索引行单列「孤儿残留」。不归属单会话的数据（`cli/log/`、`exec/shell-snapshots`、
+  `v2/checkpoints|logs|crash` 等）不扫。最近 10 分钟内仍有更新的会话标记 `extra.zcode_live`
+  且删除被拒绝（防止删到正在运行的会话——删除 zcode 会话无需也无法先关 zcode 进程）。
 
 **Multica 增强**：当 Claude Code 的项目目录匹配 Multica workspace 模式（`*multica-workspaces-<ws_id>-<task_prefix>-workdir`）时，scan.py 自动：
 1. 查找对应的 `~/multica_workspaces/<ws_id>/<task_id>/` 目录，读取 `.gc_meta.json` 判断任务完成状态
@@ -184,6 +193,10 @@ app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「
 > **为什么关的是 ChatGPT 而不是 Codex**：OpenAI 已于 2026-07-10 把独立 Codex APP 合并进
 > ChatGPT APP，会话数据（`~/.codex/`）现由 ChatGPT 进程持有；老版独立 Codex APP 用户
 > 脚本也兼容（同时检测 `Codex` 进程名）。
+>
+> **ZCode 不需要（也不能）关**：正在运行的 zcode CLI 进程往往就是执行本 skill 的 agent
+> 自身，强杀等于自杀。ZCode 的删除安全由「最近 10 分钟仍有活动的会话拒绝删除」兜底
+> （`agent_delete.delete_zcode_sessions` 删前实时复核 `session.time_updated`）。
 
 **② 开场兜底清理**（默认执行；用户主动说「别清」时才跳过）
 
@@ -191,7 +204,7 @@ app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「
 bash scripts/run.sh precleanup.py        # 默认移废纸篓（可逆）；--hard 直接删
 ```
 
-清掉三个 Agent 历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
+清掉四个 Agent 历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
 `session-env`/`file-history`/`tasks` 里**对应会话已不存在的卫星孤儿**，以及 Claude
 `sessions/<pid>.json` 里**进程已不存在（或 pid 被非 Claude 进程复用）的陈旧运行时状态文件**
 ——某个 Claude CLI 异常退出没清掉自己的状态文件时留下的残渣。这些都是删会话/退出时没收
@@ -241,8 +254,8 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
 
 ### Step S 对话里给摘要
 
-报告生成后（或配置清理成功后由空态快通道直达此处），在对话里给结论先行的一段话：三个 Agent
-合计占用、占用最大的 Agent、孤儿会话总数、最该先关注的项，以及 Claude 配置清理删除条目数和
+报告生成后（或配置清理成功后由空态快通道直达此处），在对话里给结论先行的一段话：全部
+Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关注的项，以及 Claude 配置清理删除条目数和
 是否创建备份。细节让用户看 HTML；摘要不得展示任何 `~/.claude.json` 项目键或值。
 
 **扫描 JSON 结构**（读它做摘要时照此取值，别猜——`agents` 是 **list** 不是 dict，对它用
@@ -253,7 +266,7 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
   "generated_at": 0, "scan_seconds": 0.0, "home": "/Users/<user>",
   "agents": [                      // ← list，直接遍历
     {
-      "key": "codex",             // codex | antigravity | claude
+      "key": "codex",             // codex | antigravity | claude | zcode
       "name": "Codex",
       "installed": true,           // false 时 projects 为空，跳过
       "note": "...",
@@ -276,7 +289,9 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
             { "id": "...", "title": "...", "snippet": "...",
               "mtime": 0, "size": 0, "extra": {
                 "claude_kind": "session", // 真实 Claude session；0-jsonl 合成项为 orphan_dir
-                "cwd": "/path/from/jsonl-or-history-or-fallback", // 仅真实 Claude session
+                "cwd": "/path/from-jsonl-or-history-or-fallback", // 仅真实 Claude session
+                // 仅 ZCode 会话另有：task_type（interactive|subagent_child）、parent_id、
+                // archived、task_status/model（来自 v2 任务索引）、zcode_live（10 分钟内活跃）
                 "multica": {            // 仅 Multica 会话
                   "workspace_id": "...", "task_id": "...",
                   "task_prefix": "...", "status": "cleanable",  // cleanable | active
@@ -310,7 +325,7 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
 session-analyzer/
 ├── SKILL.md
 ├── scripts/
-│   ├── scan.py                    # 只读扫描三 Agent → JSON
+│   ├── scan.py                    # 只读扫描四 Agent → JSON
 │   ├── cleanup_claude_config.py   # 扫描后过滤 ~/.claude.json 顶层 projects
 │   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（默认执行）
 │   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）

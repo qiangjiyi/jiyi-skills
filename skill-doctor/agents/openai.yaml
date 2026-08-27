@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Doctor"
+  short_description: "诊断 Skill 源码与真实执行链路问题"
+  default_prompt: "使用 $skill-doctor 诊断指定 Skill 的源码结构或一次 Claude Code/Codex 执行链路，先输出证据化报告和优化方案；只有我确认后才修改目标 Skill。"

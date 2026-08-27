@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jiyi.local/schemas/wechat-article-execution-manifest.schema.json",
+  "title": "微信公众号文章生产执行清单",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "run_id",
+    "status",
+    "package_dir",
+    "input",
+    "scope",
+    "stages",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "manifest_version": { "const": "1.0" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["pending", "running", "completed", "failed", "blocked"]
+    },
+    "package_dir": { "type": "string", "minLength": 1 },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {
+          "enum": ["raw-markdown", "package", "handoff-artifact", "pasted-content"]
+        },
+        "path": { "type": ["string", "null"] }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "account": { "type": ["string", "null"] },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_source",
+        "requested_start_stage",
+        "requested_end_stage",
+        "requested_only_stage",
+        "explicit_skips",
+        "publish_requested",
+        "execution_stages",
+        "illustration_skill",
+        "native_dispatcher"
+      ],
+      "properties": {
+        "scope_source": { "enum": ["default", "prompt"] },
+        "prompt_evidence": { "type": ["string", "null"] },
+        "requested_start_stage": { "type": ["string", "null"] },
+        "requested_end_stage": { "type": ["string", "null"] },
+        "requested_only_stage": { "type": ["string", "null"] },
+        "explicit_skips": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "publish_requested": { "type": "boolean" },
+        "illustration_skill": {
+          "enum": [
+            "baoyu-article-illustrator",
+            "jiyi-little-dancer-illustrations"
+          ]
+        },
+        "native_dispatcher": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["available", "tool"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "tool": { "const": "Skill" },
+            "id": { "type": ["string", "null"] }
+          }
+        },
+        "execution_stages": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status"],
+        "properties": {
+          "id": {
+            "enum": [
+              "prepare",
+              "format",
+              "cover",
+              "illustrate",
+              "typeset",
+              "validate",
+              "publish"
+            ]
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "skipped",
+              "failed",
+              "blocked"
+            ]
+          },
+          "skill": { "type": ["string", "null"] },
+          "invocation": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "native-skill",
+                  "bundled-publisher",
+                  "manifest-bootstrap",
+                  "manual-fallback"
+                ]
+              },
+              "id": { "type": ["string", "null"] },
+              "tool": { "const": "Skill" },
+              "source": { "const": "runtime" },
+              "skill": { "type": ["string", "null"] },
+              "authorization": { "type": ["string", "null"] }
+            }
+          },
+          "inputs": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "outputs": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "passed"],
+              "properties": {
+                "name": { "type": "string" },
+                "passed": { "type": "boolean" },
+                "detail": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "started_at": { "type": ["string", "null"] },
+          "ended_at": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "validation_report": { "type": ["string", "null"] },
+    "publish_result": { "type": ["string", "null"] },
+    "error": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  }
+}

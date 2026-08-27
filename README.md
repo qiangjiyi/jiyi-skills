@@ -9,7 +9,12 @@
 
 已开源：[**`session-analyzer`**](session-analyzer) — 会话分析与清理 ·
 [**`skill-updater`**](skill-updater) — Skill 与插件更新同步 ·
-[**`lark-doc-copy`**](lark-doc-copy) — 飞书文档完整复制
+[**`lark-doc-copy`**](lark-doc-copy) — 飞书文档完整复制 ·
+[**`wx-video-downloader`**](wx-video-downloader) — 视频号/抖音等内容下载 ·
+[**`skill-doctor`**](skill-doctor) — Skill 工作流诊断 ·
+[**`wechat-article-production`**](wechat-article-production) — 公众号文章生产 ·
+[**`xhs-card-publisher`**](xhs-card-publisher) — 小红书知识卡生成 ·
+[**`jiyi-little-dancer-illustrations`**](jiyi-little-dancer-illustrations) — 小舞伴 IP 配图
 
 <br/>
 
@@ -27,21 +32,26 @@
 
 ```text
 jiyi-skills/
-├── session-analyzer/   # ✅ 已开源
-├── skill-updater/      # ✅ 已开源
-├── lark-doc-copy/      # ✅ 已开源
+├── session-analyzer/                 # ✅ 已开源
+├── skill-updater/                    # ✅ 已开源
+├── lark-doc-copy/                    # ✅ 已开源
+├── wx-video-downloader/              # ✅ 已开源
+├── skill-doctor/                     # ✅ 已开源
+├── wechat-article-production/        # ✅ 已开源
+├── xhs-card-publisher/               # ✅ 已开源
+├── jiyi-little-dancer-illustrations/ # ✅ 已开源
 └── README.md
 ```
 
 > 每个 skill 直接放在仓库根目录下，一个目录一个 skill，不再额外嵌套 `skills/` 层。
 
-> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer`、`skill-updater` 和 `lark-doc-copy`，其余仍在本地迭代。
+> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer`、`skill-updater`、`lark-doc-copy`、`wx-video-downloader`、`skill-doctor`、`wechat-article-production`、`xhs-card-publisher` 和 `jiyi-little-dancer-illustrations`，其余仍在本地迭代。
 
 ---
 
 ## 🧹 session-analyzer
 
-对本机三个 AI Agent —— **Codex / Antigravity / Claude Code** —— 的会话数据做一次**只读**分析，产出交互式网页，并支持在网页上一键清理。
+对本机四个 AI Agent —— **Codex / Antigravity / Claude Code / ZCode** —— 的会话数据做一次**只读**分析，产出交互式网页，并支持在网页上一键清理。
 
 **它能做什么**
 
@@ -49,8 +59,8 @@ jiyi-skills/
 - 🧹 **配置同步**：依据最新 Claude Code session 分布，安全清理 `~/.claude.json` 中无真实会话的项目配置。
 - 📊 **三级统计**：按「Agent → 项目 → 会话」分层统计占用空间与会话数量。
 - 🧭 **孤儿识别**：标记工作目录已删除、却仍残留会话的孤儿项目。
-- 🖥️ **网页对比**：本地起服务（`127.0.0.1` + 随机端口 + 随机 token），三栏直观对比三个 Agent。
-- 🗑️ **安全删除**：服务端白名单校验，只能删本次扫描列出的 id；Claude / Antigravity 默认移废纸篓（可逆），Codex 数据库驱动统一硬删（不可逆），删除前浏览器二次确认。
+- 🖥️ **网页对比**：本地起服务（`127.0.0.1` + 随机端口 + 随机 token），四栏直观对比四个 Agent。
+- 🗑️ **安全删除**：服务端白名单校验，只能删本次扫描列出的 id；Claude / Antigravity 文件默认移废纸篓（可逆），Codex / ZCode 数据库行统一硬删（不可逆），删除前浏览器二次确认。
 - 📄 **静态报告**：可选导出无删除按钮的只读 HTML，便于分享留存。
 
 **快速开始**

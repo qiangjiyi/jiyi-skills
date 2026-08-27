@@ -36,8 +36,14 @@ AGENT_DATA_PREFIXES = (
     str(HOME / ".gemini"),
     str(HOME / ".codex"),
     str(HOME / ".claude"),
+    str(HOME / ".zcode"),
     str(HOME / "Library"),
 )
+
+# ZCode：会话 id 前缀（sess_<uuid> / sess_subagent_agent_<uuid>）
+ZCODE_SESS_RE = re.compile(r"^sess_[0-9a-f-]{8,}$")
+# ZCode：最近 10 分钟内仍有更新的会话视为「可能正在运行」，删除时会被拒绝
+ZCODE_LIVE_WINDOW_MS = 10 * 60 * 1000
 
 
 def dir_size(path: Path) -> int:
@@ -919,6 +925,197 @@ def _enrich_multica_sessions(agent: dict) -> None:
     agent["multica_active_count"] = active_count
 
 
+# ─────────────────────────── ZCode ───────────────────────────
+
+def _zcode_ro_connect(db: Path):
+    """只读连接 ZCode 的 SQLite。优先 mode=ro（能读 WAL 新数据）；被占用时回退
+    immutable=1（不依赖 -shm/-wal）；都失败返回 None 由调用方标注跳过。"""
+    for uri in (f"file:{db}?mode=ro", f"file:{db}?mode=ro&immutable=1"):
+        try:
+            con = sqlite3.connect(uri, uri=True)
+            con.row_factory = sqlite3.Row
+            con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            return con
+        except sqlite3.Error:
+            continue
+    return None
+
+
+def _zcode_task_index(root_v2: Path) -> dict[str, dict]:
+    """v2/tasks-index.sqlite 的 tasks 表 → {task_id: {status, model, workspace}}。
+    表缺失 / 读不了 → 空 dict（该信息仅用于展示增强，扫描照常进行）。"""
+    db = root_v2 / "tasks-index.sqlite"
+    if not db.exists():
+        return {}
+    con = _zcode_ro_connect(db)
+    if con is None:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        rows = con.execute(
+            "SELECT task_id, task_status, model, workspace_key FROM tasks "
+            "WHERE deleted = 0"
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    finally:
+        con.close()
+    for r in rows:
+        out[r["task_id"]] = {
+            "status": r["task_status"], "model": r["model"],
+            "workspace": r["workspace_key"],
+        }
+    return out
+
+
+def scan_zcode() -> dict:
+    """扫描 ZCode（~/.zcode）的会话数据。
+
+    数据模型（2026-08 调研）：
+    - 会话权威来源 = cli/db/db.sqlite 的 session 表：id = sess_*（子代理为
+      sess_subagent_agent_*，transcript 存在父会话 agents/<父id>/ 下），path =
+      真实工作目录，task_type 区分 interactive / subagent_child，时间为毫秒。
+    - 对话正文存共享库的 message/part/session_entry（session 行删除时级联）。
+    - 任务索引 = v2/tasks-index.sqlite 的 tasks 行，task_id 与会话 id 一一对应。
+    - 逐会话卫星 = cli/{artifacts,exec,image-cache,agents}/sess_<id>/ 与
+      rollout/model-io-sess_<id>.jsonl。
+    - 不归属单会话的数据（log/、exec/shell-snapshots、v2/checkpoints 等）不扫。
+    """
+    root = HOME / ".zcode" / "cli"
+    root_v2 = HOME / ".zcode" / "v2"
+    state_db = root / "db" / "db.sqlite"
+    agent = {
+        "key": "zcode",
+        "name": "ZCode",
+        "root": str(root),
+        "installed": state_db.exists(),
+        "note": (
+            "ZCode 会话正文存于共享 SQLite（db.sqlite 与 tasks-index.sqlite），删除会话即硬删数据库行，"
+            "不可逆、不进废纸篓；卫星文件（artifacts/exec/image-cache/agents/rollout）默认移废纸篓。"
+            "删除数据库行不会让 db.sqlite 文件本身缩小。最近 10 分钟内仍有活动的会话会被拒绝删除，"
+            "以防删到正在运行的会话。"
+        ),
+        "projects": [],
+    }
+    if not agent["installed"]:
+        return agent
+
+    con = _zcode_ro_connect(state_db)
+    if con is None:
+        agent["note"] += "（本次扫描数据库暂不可读，可稍后重试）"
+        return agent
+    try:
+        rows = con.execute(
+            "SELECT id, path, title, task_type, parent_id, "
+            "time_created, time_updated, time_archived FROM session "
+            "ORDER BY time_updated DESC"
+        ).fetchall()
+        # 会话正文在共享库内占用的字节（删行只是逻辑释放，文件不缩小）
+        db_bytes: dict[str, int] = {}
+        for sid, nbytes in con.execute(
+            "SELECT session_id, SUM(LENGTH(data)) FROM ("
+            " SELECT session_id, data FROM session_entry"
+            " UNION ALL SELECT session_id, data FROM message"
+            " UNION ALL SELECT session_id, data FROM part"
+            ") GROUP BY session_id"
+        ):
+            db_bytes[sid] = nbytes or 0
+    except sqlite3.OperationalError as e:
+        agent["note"] += f"（本次扫描数据库暂不可读：{e}，可稍后重试）"
+        return agent
+    finally:
+        con.close()
+
+    tasks = _zcode_task_index(root_v2)
+    now_ms = int(time.time() * 1000)
+    live_ids = {r["id"] for r in rows}
+
+    by_path: dict[str, list] = {}
+    for r in rows:
+        sid = r["id"]
+        path = (r["path"] or "").strip()
+        size = db_bytes.get(sid, 0)
+        for sub in ("artifacts", "exec", "image-cache", "agents"):
+            size += dir_size(root / sub / sid)
+        size += dir_size(root / "rollout" / f"model-io-{sid}.jsonl")
+        t = tasks.get(sid, {})
+        extra = {
+            "task_type": r["task_type"],
+            "parent_id": r["parent_id"],
+            "archived": 1 if r["time_archived"] else 0,
+        }
+        if t:
+            extra["task_status"] = t["status"]
+            extra["model"] = t["model"]
+        if now_ms - int(r["time_updated"] or 0) < ZCODE_LIVE_WINDOW_MS:
+            extra["zcode_live"] = True
+        by_path.setdefault(path, []).append({
+            "id": sid,
+            "title": (r["title"] or "").strip() or "(无标题)",
+            "snippet": "",
+            "mtime": int(r["time_updated"] or 0) // 1000,
+            "size": size,
+            "extra": extra,
+        })
+
+    for path, sessions in by_path.items():
+        orphan = bool(path) and not _path_exists(path)
+        agent["projects"].append(_make_project(
+            pid=path or "(projectless)",
+            label=path or "(无工作目录)",
+            real_path=path,
+            orphan=orphan or not path,
+            sessions=sessions,
+        ))
+
+    # 孤儿残留：数据库无会话记录的卫星目录 / rollout 日志 / 任务索引行
+    orphan_items = []
+    seen: set[str] = set()
+    for sub in ("artifacts", "exec", "image-cache", "agents"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for item in d.iterdir():
+            if item.name in live_ids or item.name in seen or not ZCODE_SESS_RE.match(item.name):
+                continue
+            seen.add(item.name)
+            orphan_items.append({
+                "id": item.name,
+                "title": f"(孤儿残留：{sub}/ 目录，数据库无此会话)",
+                "snippet": "", "mtime": mtime_of(item),
+                "size": dir_size(item), "extra": {"orphan_kind": "satellite"},
+            })
+    rollout_dir = root / "rollout"
+    if rollout_dir.is_dir():
+        for f in rollout_dir.glob("model-io-sess_*.jsonl"):
+            sid = f.name[len("model-io-"):-len(".jsonl")]
+            if sid in live_ids or sid in seen:
+                continue
+            seen.add(sid)
+            orphan_items.append({
+                "id": sid,
+                "title": "(孤儿残留：模型 I/O 日志，数据库无此会话)",
+                "snippet": "", "mtime": mtime_of(f),
+                "size": dir_size(f), "extra": {"orphan_kind": "rollout"},
+            })
+    for tid, t in tasks.items():
+        if tid in live_ids:
+            continue
+        orphan_items.append({
+            "id": f"task:{t['workspace']}|{tid}",
+            "title": "(孤儿残留：任务索引行，数据库无此会话)",
+            "snippet": "", "mtime": 0,
+            "size": 0, "extra": {"orphan_kind": "task_index"},
+        })
+    if orphan_items:
+        agent["projects"].append(_make_project(
+            pid="(zcode-orphans)", label="(孤儿残留：无数据库会话的文件/任务索引)",
+            real_path="", orphan=True, sessions=orphan_items,
+        ))
+    _finalize_agent(agent)
+    return agent
+
+
 # ─────────────────────────── shared ───────────────────────────
 
 def _is_uuid(s: str) -> bool:
@@ -977,7 +1174,7 @@ def main() -> int:
             i += 1
 
     start = time.time()
-    agents = [scan_codex(), scan_antigravity(), scan_claude()]
+    agents = [scan_codex(), scan_antigravity(), scan_claude(), scan_zcode()]
     out = {
         "generated_at": int(start),
         "scan_seconds": round(time.time() - start, 1),

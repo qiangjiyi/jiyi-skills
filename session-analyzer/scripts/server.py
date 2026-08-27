@@ -228,6 +228,8 @@ def dispatch(agent: str, scope: str, project_id: str, session_id, mode: str) -> 
         return agent_delete.delete_antigravity_sessions(ids, mode)
     if agent == "codex":
         return agent_delete.delete_codex_threads(ids, mode)
+    if agent == "zcode":
+        return agent_delete.delete_zcode_sessions(ids, mode)
     raise ValueError("未知 Agent：%s" % agent)
 
 

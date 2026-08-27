@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信公众号文章生产流水线"
+  short_description: "中文公众号文章生产，默认使用小舞伴配图，也支持宝玉配图"
+  default_prompt: "使用 $wechat-article-production 执行微信公众号文章流程；默认从原始 Markdown 完整制作并创建草稿，正文配图默认原生调用 jiyi-little-dancer-illustrations，必须使用真实小舞伴参考图并交付完整 handoff。若我说‘使用宝玉配图’、明确指定其他配图 Skill 或指定阶段范围，则按指定 Skill 和阶段执行，并记录真实执行清单。"

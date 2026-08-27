@@ -20,7 +20,7 @@
   .meta{color:var(--sub);font-size:13px;margin-top:6px}
   .lead{background:var(--accent-bg);border-radius:10px;padding:12px 16px;font-size:14px;margin-top:14px}
 
-  .overview{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:14px}
+  .overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-bottom:14px}
   .ocard{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px}
   .ocard.off{opacity:.55}
   .ocard .name{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
@@ -117,7 +117,11 @@
 <script>
 const DATA = __REPORT_DATA__;
 const CFG  = __DELETE_CONFIG__;
-const ICON = {codex:"🟦", antigravity:"🛰️", claude:"🟧"};
+const ICON = {codex:"🟦", antigravity:"🛰️", claude:"🟧", zcode:"🟩"};
+// 会话定义含数据库行的 Agent：删除不可逆（DB 行没法进废纸篓），UI 红色警示
+const HARD_DELETE_AGENTS = ["codex", "zcode"];
+const isHard = a => HARD_DELETE_AGENTS.includes(a);
+const agentName = a => (DATA.agents.find(x=>x.key===a)||{}).name || a;
 
 function fmt(b){ if(b<1024) return b+" B"; const u=["KB","MB","GB","TB"]; let i=-1,n=b;
   do{ n/=1024; i++; }while(n>=1024 && i<u.length-1); return n.toFixed(n<10?2:1)+" "+u[i]; }
@@ -178,7 +182,7 @@ function renderLead(){
   const lead=document.getElementById("lead");
   if(!max){ lead.style.display="none"; return; }
   lead.innerHTML = `占用最大的是 <b>${max.name}</b>（${fmt(max.total_size)} / ${max.session_count} 个会话）。`
-    + (orphans? ` 三个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个孤儿会话，建议优先检查和清理。` : "");
+    + (orphans? ` ${installed().length} 个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个孤儿会话，建议优先检查和清理。` : "");
 }
 
 function renderOverview(){
@@ -270,7 +274,7 @@ function projectEl(a, pi){
   if(CFG&&CFG.enabled){
     const b=sum.querySelector('[data-act="proj"]');
     b.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation();
-      doDelete(a.key,"project",p.id,null,p.label, a.key==="codex", b); });
+      doDelete(a.key,"project",p.id,null,p.label, isHard(a.key), b); });
   }
   return det;
 }
@@ -281,6 +285,9 @@ function sessionEl(a, pi, si){
   let tags="";
   if(x.source) tags+=`<span class="tag">${esc(x.source)}</span>`;
   if(x.archived) tags+=`<span class="tag">已归档</span>`;
+  if(x.task_type==="subagent_child") tags+=`<span class="tag">子代理</span>`;
+  if(x.task_status) tags+=`<span class="tag">${esc(x.task_status)}</span>`;
+  if(x.zcode_live) tags+=`<span class="badge multica-active">🟢 运行中，暂不可删</span>`;
   if(x.multica && x.multica.status==="active") tags+= `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`;
   const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
   const row=el(`<div class="srow">
@@ -288,7 +295,7 @@ function sessionEl(a, pi, si){
     <span class="smeta">${fdate(s.mtime)} · ${fmt(s.size)}</span>${delBtn}</div>`);
   if(CFG&&CFG.enabled){
     const b=row.querySelector('[data-act="sess"]');
-    b.addEventListener("click", ()=>doDelete(a.key,"session",a.projects[pi].id,s.id,s.title,a.key==="codex",b));
+    b.addEventListener("click", ()=>doDelete(a.key,"session",a.projects[pi].id,s.id,s.title,isHard(a.key),b));
   }
   return row;
 }
@@ -307,7 +314,7 @@ async function doDelete(agent, scope, projectId, sessionId, label, hasDb, btn){
   if(!await modalConfirm({
     title: scope==="project" ? "🗑 删除整个项目？" : "🗑 删除该会话？",
     body: `<span class="${hasDb?"warn":"soft"}">${esc(label)}</span>\n${hasDb
-      ? "⚠ Codex 会话删除不可逆：数据库行、jsonl 索引、相关文件一并永久删除（不进废纸篓）。"
+      ? `⚠ ${esc(agentName(agent))} 会话删除不可逆：数据库行、索引、相关文件一并永久删除（不进废纸篓）。`
       : "将移到废纸篓（可逆）。"}${bodyExtra}`,
     confirmText: "删除", danger: hasDb,
   })) return;
@@ -332,11 +339,11 @@ async function doBulkOrphanClean(agent, btn){
   // 快照 orphan project id 列表：循环里 applyDelete 会改 a.projects，必须在循环外固化
   const orphanIds = a.projects.filter(p=>p.orphan).map(p=>p.id);
   if(!orphanIds.length) return;
-  const danger = a.key==="codex";
+  const danger = isHard(agent);
   if(!await modalConfirm({
     title: `🧹 一键清理 ${a.name} 的孤儿会话？`,
     body: `将清理 <b>${orphanIds.length}</b> 个孤儿项目，共 <b>${a.orphan_session_count}</b> 个会话。\n${danger
-      ? "⚠ Codex 删除不可逆：数据库行、jsonl 索引、相关文件一并永久删除（不进废纸篓）。"
+      ? `⚠ ${esc(a.name)} 删除不可逆：数据库行、索引、相关文件一并永久删除（不进废纸篓）。`
       : "将移到废纸篓（可逆）。"}`,
     confirmText: "开始清理", danger,
   })) return;

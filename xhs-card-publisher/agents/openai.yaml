@@ -1,0 +1,4 @@
+interface:
+  display_name: "小红书卡片发布器"
+  short_description: "自动配图、排版并导出小红书多图卡片"
+  default_prompt: "Use $xhs-card-publisher to turn this Markdown article into formatted Xiaohongshu card images."

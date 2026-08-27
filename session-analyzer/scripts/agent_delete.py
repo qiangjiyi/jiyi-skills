@@ -125,10 +125,14 @@ def prune_roots() -> dict:
     """各 Agent「会残留空子目录」的清理根。清理只在这些子树内自底向上进行，绝不删
     根本身，也绝不越界——空目录有时是程序占位，范围必须收死。"""
     cl, ag, cx = HOME / ".claude", HOME / ".gemini" / "antigravity", HOME / ".codex"
+    zc = HOME / ".zcode" / "cli"
     return {
         "claude": [cl / "projects", cl / "session-env", cl / "file-history", cl / "tasks"],
         "antigravity": [ag / "brain", ag / "conversations", ag / "annotations"],
         "codex": [cx / "sessions", cx / "generated_images", HOME / "Documents" / "Codex"],
+        # rollout 下的 model-io-no-session.jsonl 等非会话文件不属于清理范围，空目录
+        # 清理只收空目录、不碰文件；exec/bash-startup 等有内容的目录天然不受影响。
+        "zcode": [zc / "artifacts", zc / "exec", zc / "image-cache", zc / "agents", zc / "rollout"],
     }
 
 
@@ -543,3 +547,153 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone() is not None
+
+
+# ─────────────────────────── ZCode ───────────────────────────
+
+# 与 scan.py 的 ZCODE_LIVE_WINDOW_MS 保持一致：最近 10 分钟仍有更新的会话拒绝删除
+ZCODE_LIVE_WINDOW_MS = 10 * 60 * 1000
+ZCODE_SESS_RE = re.compile(r"^sess_[0-9a-f-]{8,}$")
+
+
+def _zcode_root() -> Path:
+    return HOME / ".zcode" / "cli"
+
+
+def _zcode_live_sids() -> set:
+    """ZCode 数据库中现存会话的 sess id 全集（空目录清理的 keep 白名单：
+    活跃会话恰好为空的 exec/ 目录不应被收掉）。读不了库时返回空集（保守）。"""
+    db = _zcode_root() / "db" / "db.sqlite"
+    if not db.exists():
+        return set()
+    live: set[str] = set()
+    con = None
+    for uri in (f"file:{db}?mode=ro", f"file:{db}?mode=ro&immutable=1"):
+        try:
+            con = sqlite3.connect(uri, uri=True)
+            con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            break
+        except sqlite3.Error:
+            con = None
+    if con is None:
+        return live
+    try:
+        live = {r[0] for r in con.execute("SELECT id FROM session")}
+    except sqlite3.Error:
+        live = set()
+    finally:
+        con.close()
+    return live
+
+
+def _zcode_satellite_paths(sid: str) -> list:
+    root = _zcode_root()
+    return [
+        root / "artifacts" / sid,
+        root / "exec" / sid,
+        root / "image-cache" / sid,
+        root / "agents" / sid,
+        root / "rollout" / f"model-io-{sid}.jsonl",
+    ]
+
+
+def delete_zcode_sessions(ids: list, mode: str = "trash", now_ms: int | None = None) -> dict:
+    """Delete ZCode sessions + satellites + DB rows + task-index rows.
+
+    ids 里两类条目（与 scan 的呈现一致）：
+    - sess_<uuid>：正常会话 / 孤儿卫星残留（后者只清文件与任务索引行）
+    - "task:<workspace>|<task_id>"：纯任务索引残留（只删 tasks 行）
+
+    删除语义：
+    - 文件（卫星目录 + rollout 日志）按 mode 走废纸篓/硬删；
+    - 数据库行（session 级联 message/part/session_entry/todo/usage 等、
+      input_history、v2 tasks 索引行）天生硬删，不可逆——UI 已红色警示。
+    - 子代理会话的 transcript 在父会话 agents/<父id>/ 下：删父会话时把
+      子代理会话行一并删除（children 展开），目录随父会话整体入废纸篓。
+    - 最近 10 分钟内仍有更新的会话视为「正在运行」，直接拒绝删除。
+    """
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    root = _zcode_root()
+    state_db = root / "db" / "db.sqlite"
+    tasks_db = HOME / ".zcode" / "v2" / "tasks-index.sqlite"
+    removed, errors = [], []
+    db_rows: dict = {}
+
+    sess_ids: set[str] = set()
+    task_orphans: list[str] = []
+    for i in ids:
+        if isinstance(i, str) and i.startswith("task:") and "|" in i:
+            task_orphans.append(i[len("task:"):].split("|", 1)[1])
+        elif ZCODE_SESS_RE.match(i or ""):
+            sess_ids.add(i)
+        else:
+            errors.append(f"unrecognized zcode id: {i}")
+
+    # 1) 数据库：展开子代理、live 复核、级联删除
+    if state_db.exists():
+        try:
+            con = sqlite3.connect(state_db)
+            con.row_factory = sqlite3.Row
+            try:
+                # 子代理会话随父会话一起删（transcript 本就在父会话目录里）
+                expanding = set(sess_ids)
+                while expanding:
+                    qmarks = ",".join("?" * len(expanding))
+                    children = {r[0] for r in con.execute(
+                        f"SELECT id FROM session WHERE parent_id IN ({qmarks})", list(expanding))}
+                    new = children - sess_ids
+                    sess_ids |= new
+                    expanding = new
+                if sess_ids:
+                    qmarks = ",".join("?" * len(sess_ids))
+                    live = [r["id"] for r in con.execute(
+                        f"SELECT id FROM session WHERE id IN ({qmarks}) "
+                        "AND ? - time_updated < ?", list(sess_ids) + [now_ms, ZCODE_LIVE_WINDOW_MS])]
+                    if live:
+                        raise ValueError(
+                            "会话 %s 最近 10 分钟内仍有活动（可能正在运行），已拒绝删除；"
+                            "请先结束该会话再试。" % live[0])
+                    con.execute("PRAGMA foreign_keys = ON")
+                    cur = con.execute(
+                        f"DELETE FROM input_history WHERE session_id IN ({qmarks})", list(sess_ids))
+                    db_rows["db.sqlite:input_history"] = cur.rowcount
+                    cur = con.execute(
+                        f"DELETE FROM session WHERE id IN ({qmarks})", list(sess_ids))
+                    db_rows["db.sqlite:session(cascade)"] = cur.rowcount
+                    con.commit()
+            finally:
+                con.close()
+        except ValueError:
+            raise
+        except sqlite3.Error as e:
+            errors.append(f"{state_db}: {e}")
+
+    # 2) 卫星文件（含数据库里不存在的孤儿残留目录/文件）
+    for sid in sorted(sess_ids):
+        for p in _zcode_satellite_paths(sid):
+            _safe_remove(p, mode, removed, errors)
+
+    # 3) v2 任务索引行（会话删除后索引行必须同步消失，否则任务列表留死条目）
+    if tasks_db.exists():
+        tids = list(sess_ids) + task_orphans
+        try:
+            con = sqlite3.connect(tasks_db)
+            try:
+                if tids:
+                    qmarks = ",".join("?" * len(tids))
+                    cur = con.execute(
+                        f"DELETE FROM tasks WHERE task_id IN ({qmarks})", tids)
+                    db_rows["tasks-index.sqlite:tasks"] = cur.rowcount
+                    con.commit()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            errors.append(f"{tasks_db}: {e}")
+
+    # 4) 收尾：清空目录（护住仍存活会话的卫星目录，即使它暂时是空的）
+    try:
+        prune_empty_dirs(prune_roots()["zcode"], mode, removed,
+                         keep_names=_zcode_live_sids())
+    except Exception as e:
+        errors.append(f"prune: {e}")
+    return {"removed": removed, "errors": errors, "db_rows": db_rows}

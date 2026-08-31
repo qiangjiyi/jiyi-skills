@@ -486,22 +486,34 @@ def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
     # Clean stale project entries from config.toml (paths that no longer exist)
     # TODO: re-enable once the broken regex/body in _clean_codex_stale_config is finished.
     # _clean_codex_stale_config(root, removed, errors)
-    # 4) Electron 侧栏状态收尾：把已删 thread id 从 .codex-global-state.json 的白名单
-    #    命名空间剪除，做到「删完侧栏即干净」。门禁不过（App 在运行/文件非规范格式/
-    #    并发改动）只跳过并记录原因，不回滚也不阻断主删除——残留条目可由幽灵清理补收。
+    # 4) Electron 侧栏状态收尾：把已删 thread id 剪出 .codex-global-state.json 的白名单
+    #    命名空间。剪除范围 = 确证删除的 id ∪ 当前全部幽灵（实时重算）——任何一次 Codex
+    #    删除动作结束时侧栏都不留余鬼。门禁不过（App 在运行/文件非规范格式/并发改动）
+    #    只跳过并记录原因，不回滚也不阻断主删除——残留条目由流程默认清扫补收。
     result = {"removed": removed, "errors": errors, "db_rows": db_rows}
-    result["ui_state"] = _prune_codex_ui_state(target_ids)
+    result["ui_state"] = _prune_codex_ui_state(target_ids, root)
     return result
 
 
-def _prune_codex_ui_state(drop_ids: set[str]) -> dict:
+def _prune_codex_ui_state(drop_ids: set[str], root: Path) -> dict:
     """delete_codex_threads 的收尾步骤。只在全部门禁通过时写文件；任何拒绝都降级为
-    {"skipped": category} 记录在删除结果里。drop_ids 必须是本次确认删除的 thread id。"""
-    if not drop_ids:
+    {"skipped": category} 记录在删除结果里。drop_ids 必须是本次确认删除的 thread id；
+    幽灵部分由 live threads + 状态文件实时重算（此时 DB 行已删完，重算天然排除它们），
+    重算失败只影响「顺带清扫」，不影响确证删除 id 的剪除。"""
+    ghost_ids: set[str] = set()
+    spath = codex_ui_state.state_path(HOME)
+    try:
+        live = codex_ui_state.live_thread_ids(root / "state_5.sqlite")
+        raw, _ = codex_ui_state.load_state_raw(spath)
+        data = codex_ui_state.parse_state(raw)
+        ghost_ids = {g["id"] for g in codex_ui_state.ghost_entries(data, live)}
+    except (sqlite3.Error, codex_ui_state.CleanupRejected, OSError):
+        ghost_ids = set()
+    all_ids = set(drop_ids) | ghost_ids
+    if not all_ids:
         return {"skipped": "no_ids"}
     try:
-        return codex_ui_state.prune_ui_state_file(
-            codex_ui_state.state_path(HOME), set(drop_ids))
+        return codex_ui_state.prune_ui_state_file(spath, all_ids)
     except codex_ui_state.CleanupRejected as e:
         return {"skipped": e.category}
     except OSError as e:
@@ -765,3 +777,38 @@ def delete_zcode_sessions(ids: list, mode: str = "trash", now_ms: int | None = N
     except Exception as e:
         errors.append(f"prune: {e}")
     return {"removed": removed, "errors": errors, "db_rows": db_rows}
+
+
+# ─────────────────────────── CLI：流程默认清扫 ───────────────────────────
+
+def main() -> int:
+    """bash scripts/run.sh agent_delete.py --codex-ghosts
+    清理 Codex 侧栏幽灵条目（SKILL.md Step 3 的固定步骤；需 ChatGPT/Codex App 已退出）。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Codex 侧栏幽灵条目清理（需 ChatGPT/Codex App 已完全退出）")
+    ap.add_argument("--codex-ghosts", action="store_true",
+                    help="从 ~/.codex/.codex-global-state.json 剪除全部幽灵条目")
+    args = ap.parse_args()
+    if not args.codex_ghosts:
+        ap.print_help()
+        return 1
+    try:
+        r = cleanup_codex_ui_ghosts()
+    except ValueError as e:
+        print(f"[codex-ui] 已拒绝：{e}", file=sys.stderr)
+        return 1
+    if r.get("ghosts_found"):
+        print(
+            f"[codex-ui] 已剪除 {r['removed_total']} 条幽灵条目"
+            f"（{r['ghosts_found']} 个 id）backup={'created' if r['backup_created'] else 'none'}",
+            file=sys.stderr)
+    else:
+        print("[codex-ui] 无幽灵条目，no-op", file=sys.stderr)
+    print("✓ DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

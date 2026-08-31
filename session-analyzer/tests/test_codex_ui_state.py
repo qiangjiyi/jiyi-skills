@@ -392,8 +392,9 @@ class DeleteChainUITest(unittest.TestCase):
         con.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, archived INT, title TEXT,"
             " cwd TEXT, rollout_path TEXT, updated_at INT, first_user_message TEXT, preview TEXT)")
-        con.execute(
-            "INSERT INTO threads (id) VALUES (?)", (G1,))  # 待删会话
+        con.executemany(
+            "INSERT INTO threads (id) VALUES (?)",
+            [(G1,), (A1,)])  # G1 待删；A1 存活（其侧栏条目必须保留）
         con.commit()
         con.close()
         self.state_file = codex_dir / ".codex-global-state.json"
@@ -413,8 +414,28 @@ class DeleteChainUITest(unittest.TestCase):
         self.assertNotIn("skipped", ui)
         self.assertGreater(ui["removed_total"], 0)
         obj = json.loads(self.state_file.read_bytes())
+        # 确证删除的 id 全清
         self.assertNotIn(G1, obj["projectless-thread-ids"])
         self.assertNotIn(G1, obj["thread-titles"]["titles"])
+        # 删除动作连带全量扫鬼：G2 本就不在 threads 表，也应一并剪除
+        self.assertEqual(obj["pinned-thread-ids"], [])
+        self.assertNotIn(G2, obj["thread-titles"]["order"])
+        # 存活会话不受影响
+        self.assertIn(A1, obj["projectless-thread-ids"])
+        self.assertEqual(obj["thread-titles"]["titles"], {A1: "存活标题"})
+
+    def test_delete_still_prunes_confirmed_ids_when_ghost_recompute_fails(self):
+        # ghost 实时重算失败（DB 锁等）只影响「顺带清扫」，确证删除 id 的剪除照常生效
+        with mock.patch.object(codex_ui_state, "live_thread_ids",
+                               side_effect=sqlite3.OperationalError("locked")):
+            result = agent_delete.delete_codex_threads([G1])
+        ui = result["ui_state"]
+        self.assertNotIn("skipped", ui)
+        obj = json.loads(self.state_file.read_bytes())
+        self.assertNotIn(G1, obj["projectless-thread-ids"])
+        self.assertNotIn(G1, obj["thread-titles"]["titles"])
+        # G2 未被清扫（重算失败，留给下次流程步骤补收）
+        self.assertEqual(obj["pinned-thread-ids"], [G2])
 
     def test_delete_skips_ui_when_app_running(self):
         with mock.patch.object(codex_ui_state, "app_running", return_value=True):
@@ -428,6 +449,27 @@ class DeleteChainUITest(unittest.TestCase):
         self.state_file.unlink()
         result = agent_delete.delete_codex_threads([G1])
         self.assertEqual(result["ui_state"], {"skipped": "ui_state_missing"})
+
+
+class CliMainTest(unittest.TestCase):
+    """流程默认清扫的 CLI 入口（SKILL.md Step 3 ② 调用的命令）。"""
+
+    def test_runs_and_reports_sweep(self):
+        with mock.patch.object(agent_delete, "cleanup_codex_ui_ghosts",
+                               return_value={"ok": True, "ghosts_found": 2,
+                                             "removed_total": 6, "backup_created": True}):
+            with mock.patch("sys.argv", ["agent_delete.py", "--codex-ghosts"]):
+                self.assertEqual(agent_delete.main(), 0)
+
+    def test_rejection_returns_nonzero(self):
+        with mock.patch.object(agent_delete, "cleanup_codex_ui_ghosts",
+                               side_effect=ValueError("App 仍在运行")):
+            with mock.patch("sys.argv", ["agent_delete.py", "--codex-ghosts"]):
+                self.assertEqual(agent_delete.main(), 1)
+
+    def test_no_flags_prints_help_and_fails(self):
+        with mock.patch("sys.argv", ["agent_delete.py"]):
+            self.assertEqual(agent_delete.main(), 1)
 
 
 if __name__ == "__main__":

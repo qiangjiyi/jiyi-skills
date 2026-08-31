@@ -21,3 +21,6 @@ docs/
 
 # wechat-publisher: lock 文件不入库
 /wechat-publisher/package-lock.json
+
+# WorkBuddy 本地工作日志，不入库
+/.workbuddy/

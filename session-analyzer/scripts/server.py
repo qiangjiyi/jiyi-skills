@@ -189,6 +189,10 @@ def dispatch(agent: str, scope: str, project_id: str, session_id, mode: str) -> 
     a = INDEX.get(agent)
     if not a:
         raise ValueError("未知或未安装的 Agent：%s" % agent)
+    if agent == "codex" and scope == "ghost_ui":
+        # 侧栏幽灵条目清理：不在扫描 INDEX 里（幽灵本就不是存活会话），客户端不传 id，
+        # ghost 集合由 agent_delete.cleanup_codex_ui_ghosts() 执行时实时计算。
+        return agent_delete.cleanup_codex_ui_ghosts()
     proj = a["projects"].get(project_id)
     if proj is None:
         raise ValueError("项目不在本次扫描内")

@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agyhub_summaries  # noqa: E402  (sibling module, needs path bootstrap above)
+import codex_ui_state  # noqa: E402
 
 HOME = Path.home()
 
@@ -485,7 +486,74 @@ def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
     # Clean stale project entries from config.toml (paths that no longer exist)
     # TODO: re-enable once the broken regex/body in _clean_codex_stale_config is finished.
     # _clean_codex_stale_config(root, removed, errors)
-    return {"removed": removed, "errors": errors, "db_rows": db_rows}
+    # 4) Electron 侧栏状态收尾：把已删 thread id 从 .codex-global-state.json 的白名单
+    #    命名空间剪除，做到「删完侧栏即干净」。门禁不过（App 在运行/文件非规范格式/
+    #    并发改动）只跳过并记录原因，不回滚也不阻断主删除——残留条目可由幽灵清理补收。
+    result = {"removed": removed, "errors": errors, "db_rows": db_rows}
+    result["ui_state"] = _prune_codex_ui_state(target_ids)
+    return result
+
+
+def _prune_codex_ui_state(drop_ids: set[str]) -> dict:
+    """delete_codex_threads 的收尾步骤。只在全部门禁通过时写文件；任何拒绝都降级为
+    {"skipped": category} 记录在删除结果里。drop_ids 必须是本次确认删除的 thread id。"""
+    if not drop_ids:
+        return {"skipped": "no_ids"}
+    try:
+        return codex_ui_state.prune_ui_state_file(
+            codex_ui_state.state_path(HOME), set(drop_ids))
+    except codex_ui_state.CleanupRejected as e:
+        return {"skipped": e.category}
+    except OSError as e:
+        return {"skipped": f"os_error:{e.errno}"}
+
+
+def cleanup_codex_ui_ghosts() -> dict:
+    """一键清理 Codex 侧栏幽灵条目：UI 白名单命名空间里有、但 threads 表已无的 id。
+
+    安全语义：
+    - ghost 集合在执行时从 threads 表 + UI 状态文件**实时计算**，绝不信任扫描快照
+      （快照可能滞后：扫描后新开的会话在快照里不存在，宽信快照会误删存活会话的侧栏条目）。
+    - threads 表用普通 mode=ro 读（App 已退出时拿到含 WAL 的一致视图）；打不开说明仍有
+      进程持有写锁 → fail closed，绝不回退 immutable=1（那可能读到旧快照，把存活会话
+      误判成幽灵）。
+    - 客户端不传任何 id（server.py 的 ghost_ui scope 只带 token），不存在注入面。
+    - 幂等：重复执行第二次剪不到东西，no-op、不写文件。
+    """
+    running = codex_ui_state.app_running()
+    if running is not False:
+        raise ValueError(
+            "ChatGPT/Codex App 仍在运行（或无法确认已退出），已拒绝清理侧栏状态；"
+            "请先完全退出 ChatGPT App 再试。")
+    root = HOME / ".codex"
+    state_db = root / "state_5.sqlite"
+    if not state_db.exists():
+        raise ValueError("未找到 Codex 状态数据库，无需清理")
+    try:
+        live_ids = codex_ui_state.live_thread_ids(state_db)
+    except sqlite3.Error as e:
+        raise ValueError(f"Codex 状态数据库暂不可读（可能有进程持有），已保守拒绝：{e}") from e
+
+    spath = codex_ui_state.state_path(HOME)
+    try:
+        raw, _ = codex_ui_state.load_state_raw(spath)
+        data = codex_ui_state.parse_state(raw)
+    except FileNotFoundError:
+        raise ValueError("未找到 Codex 侧栏状态文件，无需清理") from None
+    except codex_ui_state.CleanupRejected as e:
+        raise ValueError(f"Codex 侧栏状态文件不可解析（{e.category}），已保守拒绝") from None
+
+    ghosts = codex_ui_state.ghost_entries(data, live_ids)
+    if not ghosts:
+        return {"ok": True, "ghosts_found": 0, "removed_total": 0,
+                "pruned": {}, "backup_created": False}
+    drop_ids = {g["id"] for g in ghosts}
+    try:
+        result = codex_ui_state.prune_ui_state_file(spath, drop_ids)
+    except codex_ui_state.CleanupRejected as e:
+        raise ValueError(f"清理被安全门禁拒绝（{e.category}），状态文件未修改") from None
+    result.update({"ok": True, "ghosts_found": len(ghosts)})
+    return result
 
 
 def _clean_codex_stale_config(root: Path, removed: list, errors: list) -> None:

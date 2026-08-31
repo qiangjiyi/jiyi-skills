@@ -194,6 +194,7 @@ function renderOverview(){
       <div class="big">${fmt(a.total_size)}</div>
       <div class="sub">${a.project_count} 个项目 · ${a.session_count} 个会话`
       + (a.orphan_session_count? ` · <span class="orphan">${a.orphan_session_count} 孤儿</span>`:"")
+      + (a.ghost_ui_entry_count? ` · <span class="orphan">👻 ${a.ghost_ui_entry_count} 侧栏幽灵</span>`:"")
       + `</div></div>`));
   });
 }
@@ -232,10 +233,13 @@ function renderSections(){
         <div class="root">${esc(a.root)}</div></div>
       <div class="nums">${a.project_count} 项目 · ${a.session_count} 会话 · ${fmt(a.total_size)}${orphanBulk}${multicaBulk}</div></div>`));
     if(a.note) sec.appendChild(el(`<div class="note">⚠️ ${esc(a.note)}</div>`));
-    if(!a.projects.length){ sec.appendChild(el(`<div class="empty">暂无会话</div>`)); box.appendChild(sec); return; }
+    const ghostBlock = ghostBlockEl(a);
+    if(ghostBlock) sec.appendChild(ghostBlock);
+    if(!a.projects.length){ sec.appendChild(el(`<div class="empty">暂无会话</div>`)); box.appendChild(sec); if(ghostBlock) bindGhost(sec,a); return; }
     const pad=el(`<div class="pad"></div>`);
     a.projects.forEach((p,pi)=> pad.appendChild(projectEl(a,pi)));
     sec.appendChild(pad); box.appendChild(sec);
+    if(ghostBlock) bindGhost(sec,a);
     // 孤儿一键清理按钮：找到刚 append 的 sec 里的按钮挂事件
     if(CFG&&CFG.enabled){
       const ob=sec.querySelector('[data-act="orphan-bulk"]');
@@ -246,6 +250,23 @@ function renderSections(){
         doBulkMulticaClean(a.key, mb); });
     }
   });
+}
+
+function ghostBlockEl(a){
+  const n = a.ghost_ui_entry_count||0;
+  if(!n) return null;
+  const rows = (a.ghost_ui_entries||[]).map(g=>
+    `<div class="srow"><span class="stitle"><span class="id">${esc(String(g.id).slice(0,12))}</span>${esc(g.title||"(无标题)")}</span>
+     <span class="smeta">${esc((g.keys||[]).join(" · "))}</span></div>`).join("");
+  const btn = (CFG&&CFG.enabled) ? `<button class="del proj" data-act="ghost">🧹 一键清理</button>` : "";
+  return el(`<details class="proj ghost"><summary class="prow">
+    <span class="caret">▶</span><span class="plabel">👻 侧栏幽灵条目（${n}）</span>
+    <span class="pmeta">侧栏状态文件残留 · 会话数据已不存在，点开必报「no rollout found」</span>${btn}</summary>
+    ${rows}</details>`);
+}
+function bindGhost(sec, a){
+  const b=sec.querySelector('[data-act="ghost"]');
+  if(b) b.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation(); doGhostClean(a.key, b); });
 }
 
 function projectEl(a, pi){
@@ -288,6 +309,7 @@ function sessionEl(a, pi, si){
   if(x.task_type==="subagent_child") tags+=`<span class="tag">子代理</span>`;
   if(x.task_status) tags+=`<span class="tag">${esc(x.task_status)}</span>`;
   if(x.zcode_live) tags+=`<span class="badge multica-active">🟢 运行中，暂不可删</span>`;
+  if(x.codex_ui_residue) tags+=`<span class="badge orphan">👻 侧栏残留</span>`;
   if(x.multica && x.multica.status==="active") tags+= `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`;
   const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
   const row=el(`<div class="srow">
@@ -391,6 +413,27 @@ async function doBulkMulticaClean(agent, btn){
   }
   toast(`Multica 清理完成：成功 ${ok} 项${fail?` / 失败 ${fail} 项`:""}（共 ${totalFiles} 个文件/目录）`);
   render();
+}
+
+async function doGhostClean(agent, btn){
+  if(!CFG||!CFG.enabled) return;
+  const a=DATA.agents.find(x=>x.key===agent); if(!a) return;
+  const n=a.ghost_ui_entry_count||0; if(!n) return;
+  if(!await modalConfirm({
+    title:`🧹 清理 ${n} 条侧栏幽灵条目？`,
+    body:`这些条目只残留在 Codex 桌面端的侧栏状态文件里，对应的会话数据已不存在（清理在服务端实时重算，不会误删存活会话）。\n⚠ 必须先<b>完全退出 ChatGPT App</b>，否则安全门禁会拒绝执行（状态文件保持原样）。\n剪除前会自动备份原文件（固定单份，可回滚）。`,
+    confirmText:"开始清理", danger:false,
+  })) return;
+  btn.disabled=true; btn.textContent="清理中…";
+  try{
+    const res=await fetch(CFG.endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({token:CFG.token,agent,scope:"ghost_ui"})});
+    const j=await res.json();
+    if(!j.ok){ toast("清理失败："+(j.error||"未知错误"),true); btn.disabled=false; btn.textContent="🧹 一键清理"; return; }
+    a.ghost_ui_entry_count=0; a.ghost_ui_entries=[];
+    toast(`已剪除 ${j.removed_total} 条侧栏幽灵条目` + (j.backup_created?"（原状态文件已备份）":""));
+    render();
+  }catch(e){ toast("请求出错："+e.message,true); btn.disabled=false; btn.textContent="🧹 一键清理"; }
 }
 
 function applyDelete(agent,scope,projectId,sessionId){

@@ -6,7 +6,8 @@ description: >
   与会话数量，标记工作目录已删除的孤儿会话，生成排版精美的交互式 HTML 报告，并可起
   本地服务在网页上按会话/按项目一键删除（默认移废纸篓、可逆）。扫描全程只读。
   务必在以下场景使用：用户说"会话太多""对话记录太多""Codex/Antigravity/Claude/
-  ZCode 会话占空间""AI Agent 历史""项目删了会话还在""孤儿会话""session cleanup"、
+  ZCode 会话占空间""AI Agent 历史""项目删了会话还在""孤儿会话""session cleanup"
+  "Codex 侧栏还有旧标题""no rollout found""幽灵条目""侧栏残留"、
   想看哪个 Agent 的会话最占地方，或想批量盘点某个项目的会话情况时。
   注意：本 skill 针对四个 AI Agent 的会话数据，不是整机磁盘分析（那是
   storage-analyzer，二者互补）。
@@ -46,6 +47,18 @@ description: >
 - **默认移废纸篓（可逆）。** 文件级删除走废纸篓；但 **Codex 与 ZCode 的 DB 行 / jsonl
   索引行天生硬删**（数据库行没法进废纸篓），Antigravity 侧栏索引 `agyhub_summaries_proto.pb`
   同样就地硬改——这些不可逆，UI 已用红色警示并二次确认。
+- **Codex 侧栏状态文件（`.codex-global-state.json`）剪除纪律。** 它被运行中的 ChatGPT
+  （内嵌 Codex）随时重写，因此**改它要求 App 已完全退出**：执行前 `pgrep` 校验 ChatGPT /
+  遗留 Codex App 主进程，检测不到进程列表时保守拒绝；`codex` CLI 引擎进程不写此 Electron
+  文件，不参与门禁。剪除只碰确证的 thread-id 命名空间（`projectless-thread-ids` /
+  `pinned-thread-ids` / `thread-titles.titles` / `thread-titles.order` /
+  `thread-workspace-root-hints`），**严禁**「凡不在 threads 表的 uuid 一律删」式宽匹配——
+  文件里有约 197 个非 thread 的 uuid（`thread-project-assignments`、`thread-descriptions-v1`
+  等几十个 key），误伤会损坏应用状态。改前整文件备份到固定单份
+  `~/.codex/.codex-global-state.json.session-analyzer.bak`（`0600`，每次覆盖）；同目录临时
+  文件 + `os.replace` 原子替换；写前重读，mtime/内容有变化即中止；文件非 Electron 规范
+  紧凑格式（round-trip 不恒等）一律拒绝，保证「只删该删的条目、其余逐字节保留」。幂等：
+  无命中即 no-op，不写文件、不产生备份；key 缺失/结构变体逐 key 跳过。
 - **路径、命令、thread id 原文展示，不翻译。** 不读取、不展示任何密钥/凭据内容。
 
 ## 执行流程
@@ -87,6 +100,10 @@ in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行�
 
 各 Agent 的会话/项目定义：
 - **Codex**（`~/.codex/`）：会话 = `state_5.sqlite` 的 `threads` 行（含 `unknown` 等所有 source）；项目按 `cwd` 聚合。
+  扫描同时只读解析 Electron 侧栏状态文件 `~/.codex/.codex-global-state.json`（侧栏列表不读
+  数据库，只删 DB 行会留下点开报「no rollout found」的**侧栏幽灵条目**）：存活会话若仍被该
+  文件引用，标记 `extra.codex_ui_residue`；「UI 命名空间里有 id、threads 表已无」的纯幽灵
+  单列为 agent 层 `ghost_ui_entry_count`（明细在 `ghost_ui_entries`）。
 - **Antigravity**（`~/.gemini/antigravity/`）：新版会话 = 侧栏索引 `agyhub_summaries_proto.pb` 里的每条记录（id/标题/时间/workspace 均解析自该 proto），按 workspace 路径归类成项目；兼容旧版未迁移时残留的 `conversations/<uuid>.pb`；无对应对话的 brain 目录单列「孤儿残留」。
 - **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该编码目录。
   真实路径按「session JSONL 顶层 `cwd` → `history.jsonl` 的 project → 编码目录启发式解码」取值；
@@ -239,7 +256,15 @@ disown
 三栏对比三个 Agent，可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
 每个 Agent 有「🧹 一键清理 N 个孤儿会话」。删除默认移废纸篓（可逆），Codex/索引类硬删项会红色
 二次确认。删除经 `agent_delete.py`，复刻各 Agent 原始清理工具的 removal set（Codex 行+jsonl+
-卫星文件、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
+卫星文件+侧栏状态剪除、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
+
+**Codex 侧栏幽灵条目（👻 区块）**：Codex 分区顶部单列「侧栏幽灵条目（N）」，展开可看每条的
+id/标题/出现位置，配「🧹 一键清理」按钮。清理走同一 `/action` 通道（`scope: "ghost_ui"`），
+**客户端不传任何 id**——ghost 集合由 `agent_delete.cleanup_codex_ui_ghosts()` 在执行时从
+threads 表 + 状态文件**实时重算**（绝不信任扫描快照，防止误删扫描后才新开的会话），规则=
+uuid 形态 ∧ 在白名单命名空间 ∧ 不在 threads 表。App 未退出、数据库被锁、文件非规范格式、
+并发改动任一命中都会整单拒绝且状态文件保持原样。会话行的 👻「侧栏残留」badge 表示该存活
+会话仍被状态文件引用（删除链路会在同一次操作里一并剪除）。
 
 只读静态报告（仅分享/留存，无删除按钮，`file://` 打开碰不到本地服务）：
 
@@ -273,6 +298,10 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
       "project_count": 0, "session_count": 0,
       "total_size": 0,             // 字节
       "orphan_session_count": 0,
+      "ghost_ui_entry_count": 0,     // 仅 codex：侧栏状态文件里的幽灵条目数（UI 有 id、threads 表已无）
+      "ghost_ui_entries": [          // 仅 codex：幽灵明细（id/title/出现的白名单 key）
+        { "id": "...", "title": "...", "keys": ["projectless-thread-ids"] }
+      ],
       "multica_cleanable_count": 0,  // 仅 claude：可安全清理
       "multica_active_count": 0,     // 仅 claude：进行中，不纳入一键清理
       "projects": [                // ← list
@@ -290,6 +319,7 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
               "mtime": 0, "size": 0, "extra": {
                 "claude_kind": "session", // 真实 Claude session；0-jsonl 合成项为 orphan_dir
                 "cwd": "/path/from-jsonl-or-history-or-fallback", // 仅真实 Claude session
+                "codex_ui_residue": true, // 仅 codex：该存活会话仍被侧栏状态文件引用
                 // 仅 ZCode 会话另有：task_type（interactive|subagent_child）、parent_id、
                 // archived、task_status/model（来自 v2 任务索引）、zcode_live（10 分钟内活跃）
                 "multica": {            // 仅 Multica 会话
@@ -325,7 +355,8 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 session-analyzer/
 ├── SKILL.md
 ├── scripts/
-│   ├── scan.py                    # 只读扫描四 Agent → JSON
+│   ├── scan.py                    # 只读扫描四 Agent → JSON（含 Codex 侧栏残留/幽灵标记）
+│   ├── codex_ui_state.py          # Codex 侧栏状态文件唯一读写入口：解析/白名单剪除/门禁写
 │   ├── cleanup_claude_config.py   # 扫描后过滤 ~/.claude.json 顶层 projects
 │   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（默认执行）
 │   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）
@@ -336,10 +367,26 @@ session-analyzer/
 ├── tests/
 │   ├── test_scan.py               # Claude cwd/orphan + 快照权限 + Codex 只读回归测试
 │   ├── test_cleanup_claude_config.py # 配置清理安全、session 竞态和备份测试
+│   ├── test_codex_ui_state.py     # 侧栏状态解析/剪除/门禁/幂等/删除链路收尾测试
 │   └── test_report_gate.py        # 清理成功标记与报告入口闸门测试
 └── assets/
     └── report_template.html       # 报告模板（只读/删除两态，看 __DELETE_CONFIG__ 切换）
 ```
+
+## Codex 侧栏幽灵条目：边界与已知残余风险
+
+- **`state_5.sqlite` 的 `projects` 行不自动删除。** 项目下所有会话删光后 `projects` 行会
+  残留，侧栏项目分组随之残留；但无法在本机确证 Codex 原生删除是否清理这些行
+  （Codex/ChatGPT 是闭源 Electron 应用，无公开删除协议可复刻），按「不确定则不做」原则，
+  本 skill 不碰 `projects` 表。如需手工清理：退出 ChatGPT 后用 sqlite3 删除
+  `projects` 中无任何 `threads.cwd` 引用的行（操作前自行备份 `state_5.sqlite`）。
+- **账号云同步可能拉回幽灵条目。** Codex 侧栏列表部分来自账号云端（跨设备同步）。本机
+  状态文件清理后重开 App，个别旧条目可能被云端重新拉回（点开仍报 no rollout found）。
+  这是预期内的残余风险：再次运行本 skill 清理即可；被云拉回且无法本地根除的条目，在
+  Codex 侧栏对条目手动删除一次（其原生删除会同步到云端），之后不会再回来。
+- **为什么 CLI `codex` 进程不参与运行门禁**：`.codex-global-state.json` 是 Electron 侧栏
+  状态，只有 ChatGPT App（内嵌 Codex）/遗留独立 Codex App 会重写；Rust 的 `codex` CLI
+  引擎不碰它。若把 CLI 进程也纳入 pgrep 门禁，日常 CLI 会话会让清理永远不可用。
 
 ## 依赖与运行前提
 

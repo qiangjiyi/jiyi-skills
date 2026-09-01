@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """Codex Electron UI sidebar state (~/.codex/.codex-global-state.json) — parse & prune.
 
-2026-08 实测发现：Codex 桌面端侧栏会话列表不读 state_5.sqlite，而是读它自己的
-Electron UI 状态文件 `.codex-global-state.json`。只删 DB 行 + rollout 会让侧栏留下
-「幽灵条目」——旧标题仍在，点开报「恢复对话失败: no rollout found for thread id …」。
+侧栏数据源实测演进（本模块的命名空间清单必须跟着 App 版本走）：
+- 2026-08 布局：thread 条目在顶层 projectless-thread-ids / pinned-thread-ids /
+  thread-titles.* / thread-workspace-root-hints。
+- 2026-09 布局（ChatGPT 内嵌 Codex，App 150+）：上述旧命名空间仍在但普遍为空，
+  thread 条目迁入顶层新 dict（thread-writable-roots /
+  thread-projectless-output-directories / thread-project-assignments）与
+  electron-persisted-atom-state 子结构（thread-descriptions-v1 /
+  heartbeat-thread-permissions-by-id / thread-reference-capability:<tid> 前缀 key）。
+  只按旧白名单剪除会「扫出 0 幽灵、no-op」，已删会话的引用原样残留。
+- 同期起侧栏列表本身大量来自账号云端同步（本地无 threads 行、无 rollout 的会话
+  也会显示，点开报「no rollout found」）。本地剪除只能清掉本地缓存残渣，
+  云端条目必须在 App 侧栏里手动删除一次（原生删除会同步云端）。
 
 本模块是该文件唯一合法的读写入口，scan.py（只读解析）与 agent_delete.py（删除收尾）
 共用。安全模型与 cleanup_claude_config.py 对齐：
 
-- **保守剪除**：只碰确证的 thread-id 命名空间 key（projectless-thread-ids /
-  pinned-thread-ids / thread-titles.titles / thread-titles.order /
-  thread-workspace-root-hints）。文件里存在大量非 thread 的 uuid（约 197 个，分布在
-  thread-project-assignments、thread-descriptions-v1、prompt-history 等几十个 key），
-  严禁「凡不在 threads 表的 uuid 一律删」式宽匹配——白名单之外的 key 一个字节不碰，
-  其中 electron-saved-workspace-roots 存的是目录路径、连 uuid 都不是。
+- **保守剪除**：只碰确证的 thread-id 命名空间（两代布局并收，见下方常量表）。
+  thread-project-assignments 的 value 含 projectId 等 uuid，只按 key 精确匹配剪条目、
+  value 一律不解析；确证排除的结构（prompt-history 用户提示词缓存、
+  chatgpt-sidebar-state-v1 的 host uuid、client-thread-bindings-v1 的 client uuid、
+  名字不含 thread 的 atom-state 子 key）一个字节不碰——严禁「凡不在 threads 表的
+  uuid 一律删」式宽匹配。
 - **运行检测 fail closed**：改文件前用 pgrep 校验 ChatGPT App（现持有 ~/.codex/）与
   遗留独立 Codex App 已退出；pgrep 本身不可用/报错时保守拒绝。注意：`codex` CLI 进程
   （Rust 引擎，comm 名恰好也是 "codex"）不写此 Electron 文件，不参与门禁——否则日常
@@ -44,6 +53,18 @@ BACKUP_SUFFIX = ".session-analyzer.bak"
 # 幽灵候选的形态守卫：只有 uuid 形态的字符串才可能成为 thread id。命名空间里若出现
 # 非 uuid 哨兵值（新版本 Codex 的未知标记），不当 thread id 处理、也不参与剪除判定。
 _UUID_SHAPE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+# ── thread-id 命名空间清单（两代布局并收，缺失/类型变体逐 key 跳过）──
+_LIST_NAMESPACES = ("projectless-thread-ids", "pinned-thread-ids")  # list 元素 = tid
+_DICT_NAMESPACES = (  # 顶层 dict，key = tid；thread-project-assignments 的 value 含
+    "thread-workspace-root-hints",          # projectId 等 uuid——只按 key 精确剪条目，
+    "thread-writable-roots",                # value 一律不解析不触碰
+    "thread-projectless-output-directories",
+    "thread-project-assignments",
+)
+_ATOM_STATE = "electron-persisted-atom-state"
+_ATOM_DICT_SUBKEYS = ("thread-descriptions-v1", "heartbeat-thread-permissions-by-id")  # 子 dict key = tid
+_ATOM_TID_PREFIX = "thread-reference-capability:"  # 子 key 形如 prefix<tid>，须全 id 匹配
 
 
 def state_path(home: Path | None = None) -> Path:
@@ -110,11 +131,15 @@ def _str_ids(value: object) -> list[str]:
     return [x for x in value if isinstance(x, str) and x]
 
 
-def _thread_id_keys(key: str, value: object) -> list[str]:
-    """dict 且 key 是 thread id 的命名空间（如 thread-workspace-root-hints）。"""
+def _dict_str_keys(value: object) -> list[str]:
     if not isinstance(value, dict):
         return []
     return [k for k in value if isinstance(k, str) and k]
+
+
+def _atom_state(data: dict) -> dict:
+    eps = data.get(_ATOM_STATE)
+    return eps if isinstance(eps, dict) else {}
 
 
 def namespace_thread_ids(data: dict) -> dict[str, set[str]]:
@@ -125,24 +150,29 @@ def namespace_thread_ids(data: dict) -> dict[str, set[str]]:
     def add(tid: str, key: str) -> None:
         found.setdefault(tid, set()).add(key)
 
-    add_list = lambda name: [add(x, name) for x in _str_ids(data.get(name))]
-    add_list("projectless-thread-ids")
-    add_list("pinned-thread-ids")
+    for name in _LIST_NAMESPACES:
+        for x in _str_ids(data.get(name)):
+            add(x, name)
 
-    hints = data.get("thread-workspace-root-hints")
-    if isinstance(hints, dict):
-        for tid in _thread_id_keys("thread-workspace-root-hints", hints):
-            add(tid, "thread-workspace-root-hints")
+    for name in _DICT_NAMESPACES:
+        for tid in _dict_str_keys(data.get(name)):
+            add(tid, name)
 
     titles = data.get("thread-titles")
     if isinstance(titles, dict):
-        order = _str_ids(titles.get("order"))
-        for tid in order:
+        for tid in _str_ids(titles.get("order")):
             add(tid, "thread-titles.order")
-        tmap = titles.get("titles")
-        if isinstance(tmap, dict):
-            for tid in _thread_id_keys("thread-titles.titles", tmap):
-                add(tid, "thread-titles.titles")
+        for tid in _dict_str_keys(titles.get("titles")):
+            add(tid, "thread-titles.titles")
+
+    eps = _atom_state(data)
+    for name in _ATOM_DICT_SUBKEYS:
+        for tid in _dict_str_keys(eps.get(name)):
+            add(tid, f"{_ATOM_STATE}.{name}")
+    prefix_len = len(_ATOM_TID_PREFIX)
+    for k in eps:
+        if isinstance(k, str) and k.startswith(_ATOM_TID_PREFIX) and len(k) > prefix_len:
+            add(k[prefix_len:], f"{_ATOM_STATE}.thread-reference-capability")
     return found
 
 
@@ -152,6 +182,12 @@ def title_of(data: dict, tid: str) -> str | None:
         t = titles["titles"].get(tid)
         if isinstance(t, str):
             return t
+    # 新布局：标题缓存迁到 atom-state 的 thread-descriptions-v1（App 自动生成的描述）
+    sub = _atom_state(data).get("thread-descriptions-v1")
+    if isinstance(sub, dict):
+        d = sub.get(tid)
+        if isinstance(d, str):
+            return d
     return None
 
 
@@ -167,14 +203,15 @@ def ghost_entries(data: dict, live_thread_ids: set[str]) -> list[dict]:
 
 def residue_ids(data: dict) -> set[str]:
     """出现在任一白名单命名空间的全部 thread id（无论是否存活）。
-    scan.py 用它给存活会话打 extra.codex_ui_residue 标记。"""
+    注意：存活会话出现在这些命名空间是正常状态（权限/描述等元数据），不构成任何
+    「残留」信号——本函数只供诊断用途，扫描与报告不再据此打标。"""
     return set(namespace_thread_ids(data))
 
 
 # ───────────────────────────── 剪除（纯内存） ─────────────────────────────
 
 def prune(data: dict, drop_ids: set[str]) -> dict[str, int]:
-    """从白名单命名空间剪除 drop_ids。返回每个 key 实际剪掉的条数；
+    """从白名单命名空间（两代布局并收）剪除 drop_ids。返回每个 key 实际剪掉的条数；
     结构变体的 key 跳过（计 0）。白名单之外的 key 不被本函数触碰。"""
     removed: dict[str, int] = {}
 
@@ -182,19 +219,20 @@ def prune(data: dict, drop_ids: set[str]) -> dict[str, int]:
         if n:
             removed[key] = removed.get(key, 0) + n
 
-    for name in ("projectless-thread-ids", "pinned-thread-ids"):
+    for name in _LIST_NAMESPACES:
         value = data.get(name)
         if isinstance(value, list):
             kept = [x for x in value if not (isinstance(x, str) and x in drop_ids)]
             count(name, len(value) - len(kept))
             data[name] = kept
 
-    hints = data.get("thread-workspace-root-hints")
-    if isinstance(hints, dict):
-        drop_here = [k for k in hints if isinstance(k, str) and k in drop_ids]
-        for k in drop_here:
-            hints.pop(k, None)
-        count("thread-workspace-root-hints", len(drop_here))
+    for name in _DICT_NAMESPACES:
+        value = data.get(name)
+        if isinstance(value, dict):
+            drop_here = [k for k in value if isinstance(k, str) and k in drop_ids]
+            for k in drop_here:
+                value.pop(k, None)
+            count(name, len(drop_here))
 
     titles = data.get("thread-titles")
     if isinstance(titles, dict):
@@ -209,6 +247,22 @@ def prune(data: dict, drop_ids: set[str]) -> dict[str, int]:
             for k in drop_here:
                 tmap.pop(k, None)
             count("thread-titles.titles", len(drop_here))
+
+    eps = _atom_state(data)
+    for name in _ATOM_DICT_SUBKEYS:
+        sub = eps.get(name)
+        if isinstance(sub, dict):
+            drop_here = [k for k in sub if isinstance(k, str) and k in drop_ids]
+            for k in drop_here:
+                sub.pop(k, None)
+            count(f"{_ATOM_STATE}.{name}", len(drop_here))
+    prefix_len = len(_ATOM_TID_PREFIX)
+    pref_drop = [k for k in list(eps)
+                 if isinstance(k, str) and k.startswith(_ATOM_TID_PREFIX)
+                 and k[prefix_len:] in drop_ids]
+    for k in pref_drop:
+        eps.pop(k, None)
+    count(f"{_ATOM_STATE}.thread-reference-capability", len(pref_drop))
     return removed
 
 
@@ -349,3 +403,41 @@ def live_thread_ids(db_path: Path) -> set[str]:
         return {r[0] for r in con.execute("SELECT id FROM threads")}
     finally:
         con.close()
+
+
+def live_ghost_entries(home: Path | None = None) -> list[dict] | None:
+    """实时重算当前幽灵条目（只读，毫秒级）。报告入口每次渲染前调用，保证页面展示的
+    幽灵数量 = 当下真实存在的数量（流程在起报告前已清扫过时，快照计数会虚高误导用户）。
+
+    返回 [] 表示「当前确实干净」；返回 None 表示无法判定（状态文件损坏 / DB 被锁 /
+    路径缺失），调用方应保留快照值——宁可显示旧数也不谎报 0。"""
+    import sqlite3
+
+    h = home or Path.home()
+    spath = state_path(h)
+    db = h / ".codex" / "state_5.sqlite"
+    try:
+        if not spath.exists() or not db.exists():
+            return []
+        live = live_thread_ids(db)
+        raw, _ = load_state_raw(spath)
+        data = parse_state(raw)
+        return ghost_entries(data, live)
+    except (CleanupRejected, OSError, sqlite3.Error):
+        return None
+
+
+def refresh_codex_ghosts(snapshot: dict, home: Path | None = None) -> dict:
+    """返回把快照里 codex agent 的幽灵计数/明细替换为实时重算结果后的浅层副本。
+    不改动传入快照（server 的删除闸门依赖快照不可变）；无法判定时原样返回副本。"""
+    out = dict(snapshot)
+    agents = list(snapshot.get("agents", []))
+    ghosts = live_ghost_entries(home)
+    if ghosts is not None:
+        agents = [dict(a) if a.get("key") == "codex" else a for a in agents]
+        for a in agents:
+            if a.get("key") == "codex":
+                a["ghost_ui_entry_count"] = len(ghosts)
+                a["ghost_ui_entries"] = ghosts
+    out["agents"] = agents
+    return out

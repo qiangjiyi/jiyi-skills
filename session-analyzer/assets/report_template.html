@@ -309,7 +309,6 @@ function sessionEl(a, pi, si){
   if(x.task_type==="subagent_child") tags+=`<span class="tag">子代理</span>`;
   if(x.task_status) tags+=`<span class="tag">${esc(x.task_status)}</span>`;
   if(x.zcode_live) tags+=`<span class="badge multica-active">🟢 运行中，暂不可删</span>`;
-  if(x.codex_ui_residue) tags+=`<span class="badge orphan">👻 侧栏残留</span>`;
   if(x.multica && x.multica.status==="active") tags+= `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`;
   const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
   const row=el(`<div class="srow">

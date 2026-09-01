@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delete  # noqa: E402
 import cleanup_claude_config  # noqa: E402
+import codex_ui_state  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "..", "assets", "report_template.html")
@@ -251,7 +252,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            blob = json.dumps(DATA, ensure_ascii=False)
+            # 幽灵计数/明细每次页面加载都实时重算：流程在起报告前已清扫过时，
+            # 快照里的旧计数会虚高误导用户；重算失败则回落到快照值。
+            blob = json.dumps(codex_ui_state.refresh_codex_ghosts(DATA), ensure_ascii=False)
             cfg = json.dumps({"token": TOKEN, "endpoint": "/action", "enabled": True})
             html = TPL.replace("__REPORT_DATA__", blob).replace("__DELETE_CONFIG__", cfg)
             self._send(200, html, "text/html; charset=utf-8")

@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_claude_config  # noqa: E402
+import codex_ui_state  # noqa: E402
 
 # HTML template (relative to this file: ../assets/report_template.html).
 TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "report_template.html"
@@ -29,7 +30,8 @@ def render_readonly(data: dict) -> str:
     """
     with open(TEMPLATE, encoding="utf-8") as f:
         tpl = f.read()
-    blob = json.dumps(data, ensure_ascii=False)
+    # 幽灵计数/明细在构建时实时重算（快照可能早于此前的清扫步骤，旧计数会虚高误导）
+    blob = json.dumps(codex_ui_state.refresh_codex_ghosts(data), ensure_ascii=False)
     return tpl.replace("__REPORT_DATA__", blob).replace("__DELETE_CONFIG__", "null")
 
 

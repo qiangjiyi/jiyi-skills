@@ -26,8 +26,9 @@ SPEC.loader.exec_module(agent_delete)
 G1 = "019e0001-1111-7111-8111-000000000001"
 G2 = "019e0002-2222-7222-8222-000000000002"
 A1 = "019e000a-aaaa-7aaa-8aaa-00000000000a"
-N1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"  # 干扰：结构上像 thread id，但属于别的 key
-N2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+N1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"  # 干扰：thread-project-assignments value 里的 projectId
+N2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"  # 干扰：chatgpt-sidebar-state-v1 的 host uuid
+N3 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"  # 干扰：client-thread-bindings-v1 的 client uuid
 
 
 def dumps(obj) -> bytes:
@@ -36,39 +37,73 @@ def dumps(obj) -> bytes:
 
 
 def fixture_state() -> dict:
-    """覆盖：幽灵（四个白名单 key 各处）、存活、非 thread 干扰 uuid（只出现在非白名单
-    key——对齐真实文件里约 197 个干扰 uuid 的分布）、非白名单 key、缺失 key 变体。
-    注意 G1/G2 也被刻意放进非白名单 key（thread-project-assignments /
-    thread-descriptions-v1）：剪除只许动白名单，非白名单里的同 id 条目必须原样保留。"""
+    """覆盖两代命名空间（2026-08 旧布局 + 2026-09 新布局），并锁定确证排除结构的边界：
+    prompt-history（用户提示词缓存）、chatgpt-sidebar-state-v1（host uuid 为 key）、
+    client-thread-bindings-v1（client uuid 为 key）、名字不含 thread 的 atom-state 子 key、
+    thread-project-assignments 的 value（projectId）——即使其中的条目属于幽灵/被删
+    thread，也一个字节都不能动。"""
     return {
+        # ── 2026-08 旧布局 ──
         "projectless-thread-ids": [G1, A1, "not-a-uuid", 42, None],
         "pinned-thread-ids": [G2],
         "thread-workspace-root-hints": {G1: "/tmp/ws", A1: "/tmp/alive"},
         "thread-titles": {"titles": {G1: "幽灵标题", A1: "存活标题"}, "order": [G1, A1, G2]},
-        # 非白名单：即使含幽灵/干扰 uuid 也绝不能被碰
-        "thread-project-assignments": {N1: "p1", G1: "p2"},
+        # ── 2026-09 新布局：顶层 dict（key = thread id）──
+        "thread-writable-roots": {G2: ["/tmp/g2"], A1: ["/tmp/alive"]},
+        "thread-projectless-output-directories": {G1: "/tmp/out1", G2: "/tmp/out2",
+                                                  "not-a-dir-key": "/tmp/x"},
+        "thread-project-assignments": {
+            G1: {"projectKind": "local", "projectId": "local-abc"},
+            A1: {"projectKind": "remote", "projectId": N1},
+        },
+        # ── 2026-09 新布局：electron-persisted-atom-state 子结构 ──
+        "electron-persisted-atom-state": {
+            "thread-descriptions-v1": {G1: "幽灵描述", A1: "存活描述"},
+            "heartbeat-thread-permissions-by-id": {G2: {"ask": True}, A1: {"ask": False}},
+            "thread-reference-capability:" + G1: "agentic",
+            "thread-reference-capability:" + A1: "agentic",
+            # 确证排除的结构
+            "prompt-history": {"global": ["global-prompt"], G2: ["per-thread-prompt"]},
+            "chatgpt-sidebar-state-v1": {N2: {"pinnedProjects": [], "projects": []}},
+            "client-thread-bindings-v1": {"client-new-thread:" + N3: G2},
+            "composer-prompt-drafts-v1": {G2: "draft"},
+        },
+        # ── 与 thread 无关的顶层 key ──
         "electron-saved-workspace-roots": ["/Users/x/SomeProject"],
-        "thread-descriptions-v1": {N2: "desc", G2: "desc2"},
         "unrelated": {"keep": [1, 2, 3]},
     }
 
 
-LIVE = {A1}  # threads 表只有 A1 存活 → G1/G2 是幽灵，N1/N2 与 threads 判定无关
+LIVE = {A1}  # threads 表只有 A1 存活 → G1/G2 是幽灵，N1/N2/N3 与 threads 判定无关
+
+G1_KEYS = {"projectless-thread-ids", "thread-workspace-root-hints",
+           "thread-titles.titles", "thread-titles.order",
+           "thread-projectless-output-directories", "thread-project-assignments",
+           "electron-persisted-atom-state.thread-descriptions-v1",
+           "electron-persisted-atom-state.thread-reference-capability"}
+G2_KEYS = {"pinned-thread-ids", "thread-titles.order",
+           "thread-writable-roots", "thread-projectless-output-directories",
+           "electron-persisted-atom-state.heartbeat-thread-permissions-by-id"}
+A1_KEYS = {"projectless-thread-ids", "thread-workspace-root-hints",
+           "thread-titles.titles", "thread-titles.order",
+           "thread-writable-roots", "thread-project-assignments",
+           "electron-persisted-atom-state.thread-descriptions-v1",
+           "electron-persisted-atom-state.heartbeat-thread-permissions-by-id",
+           "electron-persisted-atom-state.thread-reference-capability"}
 
 
 class NamespaceTest(unittest.TestCase):
     def test_namespace_collection_is_defensive(self):
         found = codex_ui_state.namespace_thread_ids(fixture_state())
-        four = {"projectless-thread-ids", "thread-workspace-root-hints",
-                "thread-titles.titles", "thread-titles.order"}
-        self.assertEqual(found[G1], four)
-        self.assertEqual(found[G2], {"pinned-thread-ids", "thread-titles.order"})
-        self.assertEqual(found[A1], four)
+        self.assertEqual(found[G1], G1_KEYS)
+        self.assertEqual(found[G2], G2_KEYS)
+        self.assertEqual(found[A1], A1_KEYS)
         # 非 uuid 哨兵也会被收集进命名空间，但 ghost 判定有形态守卫（见下）
         self.assertEqual(found["not-a-uuid"], {"projectless-thread-ids"})
+        self.assertEqual(found["not-a-dir-key"], {"thread-projectless-output-directories"})
         # 干扰 uuid 不在白名单 key 里，不参与收集
-        self.assertNotIn(N1, found)
-        self.assertNotIn(N2, found)
+        for n in (N1, N2, N3):
+            self.assertNotIn(n, found)
 
     def test_uuid_shape_guard_blocks_non_uuid_ghosts(self):
         data = {"projectless-thread-ids": ["not-a-uuid", G1]}
@@ -81,8 +116,22 @@ class NamespaceTest(unittest.TestCase):
             "thread-titles.order": None,                    # 干扰项：不是真实结构
             "pinned-thread-ids": {"not": "a list"},         # 类型变体
             "thread-workspace-root-hints": [G1],            # 该是 dict 却是 list
+            "thread-writable-roots": "not-a-dict",          # 新布局类型变体
+            "thread-project-assignments": [G1],             # 该是 dict 却是 list
+            "electron-persisted-atom-state": "not-a-dict",  # atom-state 整体类型变体
             "projectless-thread-ids": [G1],
         }
+        found = codex_ui_state.namespace_thread_ids(data)
+        self.assertEqual(found, {G1: {"projectless-thread-ids"}})
+
+    def test_atom_state_subkey_type_variants_are_skipped(self):
+        data = {"projectless-thread-ids": [G1],
+                "electron-persisted-atom-state": {
+            "thread-descriptions-v1": "not-a-dict",
+            "heartbeat-thread-permissions-by-id": [G2],
+            "thread-reference-capability": G1,          # 无冒号前缀拼接，不是 tid key
+            "thread-reference-capability:": G1,         # 前缀后为空
+        }}
         found = codex_ui_state.namespace_thread_ids(data)
         self.assertEqual(found, {G1: {"projectless-thread-ids"}})
 
@@ -92,6 +141,11 @@ class NamespaceTest(unittest.TestCase):
         self.assertEqual(codex_ui_state.namespace_thread_ids(data),
                          {G1: {"projectless-thread-ids"}})
         self.assertIsNone(codex_ui_state.title_of(data, G1))
+
+    def test_title_of_falls_back_to_atom_state_descriptions(self):
+        # 2026-09 布局：thread-titles 缺失时，描述缓存可用作幽灵标签
+        data = {"electron-persisted-atom-state": {"thread-descriptions-v1": {G1: "幽灵描述"}}}
+        self.assertEqual(codex_ui_state.title_of(data, G1), "幽灵描述")
 
     def test_ghost_entries_excludes_live(self):
         ghosts = codex_ui_state.ghost_entries(fixture_state(), LIVE)
@@ -105,24 +159,54 @@ class PruneInMemoryTest(unittest.TestCase):
     def test_prune_removes_only_dropped(self):
         data = fixture_state()
         removed = codex_ui_state.prune(data, {G1, G2})
-        # 命中计数
+        # 命中计数（两代命名空间合计）
         self.assertEqual(removed, {
             "projectless-thread-ids": 1,
             "pinned-thread-ids": 1,
             "thread-workspace-root-hints": 1,
             "thread-titles.titles": 1,
             "thread-titles.order": 2,
+            "thread-writable-roots": 1,
+            "thread-projectless-output-directories": 2,
+            "thread-project-assignments": 1,
+            "electron-persisted-atom-state.thread-descriptions-v1": 1,
+            "electron-persisted-atom-state.heartbeat-thread-permissions-by-id": 1,
+            "electron-persisted-atom-state.thread-reference-capability": 1,
         })
-        # 白名单内：G 全清、A 与非 uuid 哨兵保留
+        # 旧布局：G 全清、A 与非 uuid 哨兵保留
         self.assertEqual(data["projectless-thread-ids"], [A1, "not-a-uuid", 42, None])
         self.assertEqual(data["pinned-thread-ids"], [])
         self.assertEqual(data["thread-workspace-root-hints"], {A1: "/tmp/alive"})
         self.assertEqual(data["thread-titles"], {"titles": {A1: "存活标题"}, "order": [A1]})
-        # 白名单外：同 id 的条目也一个字节都不动
-        self.assertEqual(data["thread-project-assignments"], {N1: "p1", G1: "p2"})
-        self.assertEqual(data["thread-descriptions-v1"], {N2: "desc", G2: "desc2"})
+        # 新布局：G 全清、A 保留
+        self.assertEqual(data["thread-writable-roots"], {A1: ["/tmp/alive"]})
+        self.assertEqual(data["thread-projectless-output-directories"], {"not-a-dir-key": "/tmp/x"})
+        self.assertEqual(data["thread-project-assignments"],
+                         {A1: {"projectKind": "remote", "projectId": N1}})
+        eps = data["electron-persisted-atom-state"]
+        self.assertEqual(eps["thread-descriptions-v1"], {A1: "存活描述"})
+        self.assertEqual(eps["heartbeat-thread-permissions-by-id"], {A1: {"ask": False}})
+        self.assertEqual(sorted(eps.keys()),
+                         sorted(["thread-descriptions-v1", "heartbeat-thread-permissions-by-id",
+                                 "thread-reference-capability:" + A1, "prompt-history",
+                                 "chatgpt-sidebar-state-v1", "client-thread-bindings-v1",
+                                 "composer-prompt-drafts-v1"]))
+        # 确证排除的结构：即使含幽灵/被删 thread 的条目也一个字节不动
+        self.assertEqual(eps["prompt-history"], {"global": ["global-prompt"], G2: ["per-thread-prompt"]})
+        self.assertEqual(eps["chatgpt-sidebar-state-v1"], {N2: {"pinnedProjects": [], "projects": []}})
+        self.assertEqual(eps["client-thread-bindings-v1"], {"client-new-thread:" + N3: G2})
+        self.assertEqual(eps["composer-prompt-drafts-v1"], {G2: "draft"})
         self.assertEqual(data["unrelated"], {"keep": [1, 2, 3]})
         self.assertEqual(data["electron-saved-workspace-roots"], ["/Users/x/SomeProject"])
+
+    def test_prune_prefix_key_requires_full_tid_match(self):
+        # 前缀 key 只允许全 id 精确匹配：前缀相同的截断 id 不许被剪
+        partial = "thread-reference-capability:" + G1[:13]
+        data = {"electron-persisted-atom-state": {
+            "thread-reference-capability:" + G1: "agentic", partial: "agentic"}}
+        removed = codex_ui_state.prune(data, {G1})
+        self.assertEqual(removed, {"electron-persisted-atom-state.thread-reference-capability": 1})
+        self.assertEqual(list(data["electron-persisted-atom-state"]), [partial])
 
     def test_prune_is_idempotent(self):
         data = fixture_state()
@@ -131,7 +215,8 @@ class PruneInMemoryTest(unittest.TestCase):
         self.assertEqual(again, {})
 
     def test_prune_with_malformed_keys_does_not_raise(self):
-        data = {"projectless-thread-ids": "bad", "thread-titles": None}
+        data = {"projectless-thread-ids": "bad", "thread-titles": None,
+                "electron-persisted-atom-state": {"thread-descriptions-v1": 7}}
         self.assertEqual(codex_ui_state.prune(data, {G1}), {})
 
 
@@ -178,7 +263,7 @@ class PruneFileTest(unittest.TestCase):
     def test_prunes_exactly_and_preserves_rest_byte_for_byte(self, _m):
         p = write_state(self.tmp, self.raw_state())
         result = codex_ui_state.prune_ui_state_file(p, {G1, G2})
-        self.assertEqual(result["removed_total"], 6)
+        self.assertEqual(result["removed_total"], 13)
         self.assertTrue(result["backup_created"])
         after = p.read_bytes()
         # 逐字节期望：手写的「同一序列化规范下去掉 G1/G2 条目」的字节串，
@@ -188,15 +273,26 @@ class PruneFileTest(unittest.TestCase):
             '"pinned-thread-ids":[],'
             '"thread-workspace-root-hints":{"%s":"/tmp/alive"},'
             '"thread-titles":{"titles":{"%s":"存活标题"},"order":["%s"]},'
-            '"thread-project-assignments":{"%s":"p1","%s":"p2"},'
+            '"thread-writable-roots":{"%s":["/tmp/alive"]},'
+            '"thread-projectless-output-directories":{"not-a-dir-key":"/tmp/x"},'
+            '"thread-project-assignments":{"%s":{"projectKind":"remote","projectId":"%s"}},'
+            '"electron-persisted-atom-state":{'
+            '"thread-descriptions-v1":{"%s":"存活描述"},'
+            '"heartbeat-thread-permissions-by-id":{"%s":{"ask":false}},'
+            '"thread-reference-capability:%s":"agentic",'
+            '"prompt-history":{"global":["global-prompt"],"%s":["per-thread-prompt"]},'
+            '"chatgpt-sidebar-state-v1":{"%s":{"pinnedProjects":[],"projects":[]}},'
+            '"client-thread-bindings-v1":{"client-new-thread:%s":"%s"},'
+            '"composer-prompt-drafts-v1":{"%s":"draft"}},'
             '"electron-saved-workspace-roots":["/Users/x/SomeProject"],'
-            '"thread-descriptions-v1":{"%s":"desc","%s":"desc2"},'
             '"unrelated":{"keep":[1,2,3]}}'
-        ) % (A1, A1, A1, A1, N1, G1, N2, G2)
+        ) % (A1, A1, A1, A1, A1, A1, N1, A1, A1, A1, G2, N2, N3, G2, G2)
         self.assertEqual(after, expected.encode("utf-8"))
-        # 抽查解析后内容
+        # 抽查解析后内容：确证排除的结构原样保留
         obj = json.loads(after)
-        self.assertEqual(obj["thread-project-assignments"], {N1: "p1", G1: "p2"})
+        eps = obj["electron-persisted-atom-state"]
+        self.assertEqual(eps["prompt-history"], {"global": ["global-prompt"], G2: ["per-thread-prompt"]})
+        self.assertEqual(eps["client-thread-bindings-v1"], {"client-new-thread:" + N3: G2})
         self.assertEqual(obj["unrelated"], {"keep": [1, 2, 3]})
 
     def test_backup_is_0600_single_copy_of_original(self, _m):
@@ -338,17 +434,29 @@ class GhostCleanupIntegrationTest(unittest.TestCase):
         result = agent_delete.cleanup_codex_ui_ghosts()
         self.assertTrue(result["ok"])
         self.assertEqual(result["ghosts_found"], 2)
-        self.assertEqual(result["removed_total"], 6)
+        self.assertEqual(result["removed_total"], 13)
         obj = json.loads(self.state_file.read_bytes())
-        # 幽灵条目全清
+        # 幽灵条目全清（两代命名空间）
         self.assertNotIn(G1, obj["projectless-thread-ids"])
         self.assertNotIn(G2, obj["pinned-thread-ids"])
         self.assertNotIn(G1, obj["thread-workspace-root-hints"])
         self.assertNotIn(G1, obj["thread-titles"]["titles"])
         self.assertNotIn(G2, obj["thread-titles"]["order"])
+        self.assertNotIn(G2, obj["thread-writable-roots"])
+        self.assertNotIn(G1, obj["thread-projectless-output-directories"])
+        self.assertNotIn(G1, obj["thread-project-assignments"])
+        eps = obj["electron-persisted-atom-state"]
+        self.assertNotIn(G1, eps["thread-descriptions-v1"])
+        self.assertNotIn(G2, eps["heartbeat-thread-permissions-by-id"])
+        self.assertNotIn("thread-reference-capability:" + G1, eps)
+        # 确证排除的结构不受影响（含幽灵 id 的缓存条目原样保留）
+        self.assertEqual(eps["prompt-history"], {"global": ["global-prompt"], G2: ["per-thread-prompt"]})
         # 存活会话的侧栏条目保留
         self.assertIn(A1, obj["projectless-thread-ids"])
         self.assertEqual(obj["thread-titles"]["titles"], {A1: "存活标题"})
+        self.assertEqual(obj["thread-project-assignments"],
+                         {A1: {"projectKind": "remote", "projectId": N1}})
+        self.assertEqual(eps["thread-descriptions-v1"], {A1: "存活描述"})
 
     def test_idempotent_second_run(self):
         agent_delete.cleanup_codex_ui_ghosts()
@@ -414,15 +522,22 @@ class DeleteChainUITest(unittest.TestCase):
         self.assertNotIn("skipped", ui)
         self.assertGreater(ui["removed_total"], 0)
         obj = json.loads(self.state_file.read_bytes())
-        # 确证删除的 id 全清
+        # 确证删除的 id 全清（两代命名空间）
         self.assertNotIn(G1, obj["projectless-thread-ids"])
         self.assertNotIn(G1, obj["thread-titles"]["titles"])
+        self.assertNotIn(G1, obj["thread-project-assignments"])
+        eps = obj["electron-persisted-atom-state"]
+        self.assertNotIn(G1, eps["thread-descriptions-v1"])
+        self.assertNotIn("thread-reference-capability:" + G1, eps)
         # 删除动作连带全量扫鬼：G2 本就不在 threads 表，也应一并剪除
         self.assertEqual(obj["pinned-thread-ids"], [])
         self.assertNotIn(G2, obj["thread-titles"]["order"])
+        self.assertNotIn(G2, obj["thread-writable-roots"])
+        self.assertNotIn(G2, eps["heartbeat-thread-permissions-by-id"])
         # 存活会话不受影响
         self.assertIn(A1, obj["projectless-thread-ids"])
         self.assertEqual(obj["thread-titles"]["titles"], {A1: "存活标题"})
+        self.assertIn(A1, eps["thread-descriptions-v1"])
 
     def test_delete_still_prunes_confirmed_ids_when_ghost_recompute_fails(self):
         # ghost 实时重算失败（DB 锁等）只影响「顺带清扫」，确证删除 id 的剪除照常生效
@@ -449,6 +564,67 @@ class DeleteChainUITest(unittest.TestCase):
         self.state_file.unlink()
         result = agent_delete.delete_codex_threads([G1])
         self.assertEqual(result["ui_state"], {"skipped": "ui_state_missing"})
+
+
+class LiveGhostRefreshTest(unittest.TestCase):
+    """live_ghost_entries / refresh_codex_ghosts：报告入口的幽灵实时重算。
+    契约：报告展示的幽灵数量必须是当下真实存在的数量——流程在起报告前已清扫过时，
+    快照旧计数被实时结果覆盖（通常为 0，页面隐藏 👻 区块），不得误导用户。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        codex_dir = self.home / ".codex"
+        codex_dir.mkdir(parents=True)
+        db = codex_dir / "state_5.sqlite"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+        con.executemany("INSERT INTO threads (id) VALUES (?)", [(A1,)])
+        con.commit()
+        con.close()
+        self.state_file = codex_dir / ".codex-global-state.json"
+        self.state_file.write_bytes(dumps(fixture_state()))
+
+    def snapshot(self) -> dict:
+        return {"agents": [
+            {"key": "codex", "installed": True, "ghost_ui_entry_count": 99,
+             "ghost_ui_entries": [{"id": "stale", "keys": [], "title": None}]},
+            {"key": "zcode", "installed": True},
+        ]}
+
+    def test_live_recompute_replaces_snapshot_counts(self):
+        # 快照虚高 99 → 实时重算为真实的 2（G1/G2）
+        out = codex_ui_state.refresh_codex_ghosts(self.snapshot(), self.home)
+        codex = out["agents"][0]
+        self.assertEqual(codex["ghost_ui_entry_count"], 2)
+        self.assertEqual({g["id"] for g in codex["ghost_ui_entries"]}, {G1, G2})
+        # 非 codex agent 原样保留
+        self.assertEqual(out["agents"][1], {"key": "zcode", "installed": True})
+
+    def test_original_snapshot_not_mutated(self):
+        snap = self.snapshot()
+        codex_ui_state.refresh_codex_ghosts(snap, self.home)
+        self.assertEqual(snap["agents"][0]["ghost_ui_entry_count"], 99)
+
+    def test_clean_state_reports_zero(self):
+        # 已清扫干净（状态文件里无幽灵）→ 0（页面会隐藏 👻 区块）
+        data = codex_ui_state.parse_state(self.state_file.read_bytes())
+        codex_ui_state.prune(data, {G1, G2})
+        self.state_file.write_bytes(codex_ui_state.canonical_bytes(data))
+        out = codex_ui_state.refresh_codex_ghosts(self.snapshot(), self.home)
+        self.assertEqual(out["agents"][0]["ghost_ui_entry_count"], 0)
+        self.assertEqual(out["agents"][0]["ghost_ui_entries"], [])
+
+    def test_unreadable_state_falls_back_to_snapshot(self):
+        # 状态文件损坏 → None → 保留快照值（宁可显示旧数也不谎报 0）
+        self.state_file.write_bytes(b"not-json")
+        out = codex_ui_state.refresh_codex_ghosts(self.snapshot(), self.home)
+        self.assertEqual(out["agents"][0]["ghost_ui_entry_count"], 99)
+
+    def test_missing_codex_dir_reports_clean(self):
+        # 未装 Codex / 文件不存在 → 真实含义是干净（0），而非无法判定
+        self.assertEqual(codex_ui_state.live_ghost_entries(Path("/nonexistent-home")), [])
 
 
 class CliMainTest(unittest.TestCase):

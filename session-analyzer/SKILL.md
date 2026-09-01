@@ -50,11 +50,19 @@ description: >
 - **Codex 侧栏状态文件（`.codex-global-state.json`）剪除纪律。** 它被运行中的 ChatGPT
   （内嵌 Codex）随时重写，因此**改它要求 App 已完全退出**：执行前 `pgrep` 校验 ChatGPT /
   遗留 Codex App 主进程，检测不到进程列表时保守拒绝；`codex` CLI 引擎进程不写此 Electron
-  文件，不参与门禁。剪除只碰确证的 thread-id 命名空间（`projectless-thread-ids` /
-  `pinned-thread-ids` / `thread-titles.titles` / `thread-titles.order` /
-  `thread-workspace-root-hints`），**严禁**「凡不在 threads 表的 uuid 一律删」式宽匹配——
-  文件里有约 197 个非 thread 的 uuid（`thread-project-assignments`、`thread-descriptions-v1`
-  等几十个 key），误伤会损坏应用状态。改前整文件备份到固定单份
+  文件，不参与门禁。剪除只碰确证的 thread-id 命名空间，**两代布局并收**（App 改版会迁移
+  布局，只认旧清单会「扫出 0 幽灵、no-op」而残渣原样留着）：2026-08 旧布局
+  （`projectless-thread-ids` / `pinned-thread-ids` / `thread-titles.titles` /
+  `thread-titles.order` / `thread-workspace-root-hints`）＋ 2026-09 新布局
+  （`thread-writable-roots` / `thread-projectless-output-directories` /
+  `thread-project-assignments` ＋ `electron-persisted-atom-state` 下的
+  `thread-descriptions-v1` / `heartbeat-thread-permissions-by-id` /
+  `thread-reference-capability:<tid>` 前缀 key）。`thread-project-assignments` 的 value
+  含 projectId 等 uuid，只按 key 精确匹配剪条目、value 不解析；确证排除的结构
+  （`prompt-history` 用户提示词缓存、`chatgpt-sidebar-state-v1` 的 host uuid、
+  `client-thread-bindings-v1` 的 client uuid、名字不含 thread 的 atom-state 子 key）
+  一个字节不碰，**严禁**「凡不在 threads 表的 uuid 一律删」式宽匹配——误伤会损坏应用
+  状态。改前整文件备份到固定单份
   `~/.codex/.codex-global-state.json.session-analyzer.bak`（`0600`，每次覆盖）；同目录临时
   文件 + `os.replace` 原子替换；写前重读，mtime/内容有变化即中止；文件非 Electron 规范
   紧凑格式（round-trip 不恒等）一律拒绝，保证「只删该删的条目、其余逐字节保留」。幂等：
@@ -100,10 +108,14 @@ in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行�
 
 各 Agent 的会话/项目定义：
 - **Codex**（`~/.codex/`）：会话 = `state_5.sqlite` 的 `threads` 行（含 `unknown` 等所有 source）；项目按 `cwd` 聚合。
-  扫描同时只读解析 Electron 侧栏状态文件 `~/.codex/.codex-global-state.json`（侧栏列表不读
-  数据库，只删 DB 行会留下点开报「no rollout found」的**侧栏幽灵条目**）：存活会话若仍被该
-  文件引用，标记 `extra.codex_ui_residue`；「UI 命名空间里有 id、threads 表已无」的纯幽灵
-  单列为 agent 层 `ghost_ui_entry_count`（明细在 `ghost_ui_entries`）。
+  扫描同时只读解析 Electron 侧栏状态文件 `~/.codex/.codex-global-state.json`（只删 DB 行会留下
+  点开报「no rollout found」的**侧栏幽灵条目**；thread 引用散布在两代布局的命名空间里，详见
+  铁律段）。存活会话被该文件引用是正常状态（权限/描述/项目分配等元数据），**不打任何
+  「侧栏残留」badge**——2026-09 实测该标记会覆盖几乎所有正常会话，纯属误导，已移除；
+  「UI 命名空间里有 id、threads 表已无」的纯幽灵单列为 agent 层 `ghost_ui_entry_count`
+  （明细在 `ghost_ui_entries`，标题优先取 `thread-titles`，缺失时回退 atom-state 的
+  `thread-descriptions-v1`）。注意侧栏还会显示**账号云端同步**的会话（本地无 threads
+  行/rollout），本地扫描与剪除都看不到它们——见「边界与已知残余风险」。
 - **Antigravity**（`~/.gemini/antigravity/`）：新版会话 = 侧栏索引 `agyhub_summaries_proto.pb` 里的每条记录（id/标题/时间/workspace 均解析自该 proto），按 workspace 路径归类成项目；兼容旧版未迁移时残留的 `conversations/<uuid>.pb`；无对应对话的 brain 目录单列「孤儿残留」。
 - **Claude Code**（`~/.claude/`）：会话 = `projects/<编码路径>/<uuid>.jsonl`；项目 = 该编码目录。
   真实路径按「session JSONL 顶层 `cwd` → `history.jsonl` 的 project → 编码目录启发式解码」取值；
@@ -265,12 +277,16 @@ disown
 卫星文件+侧栏状态剪除、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
 
 **Codex 侧栏幽灵条目（👻 区块）**：Codex 分区顶部单列「侧栏幽灵条目（N）」，展开可看每条的
-id/标题/出现位置，配「🧹 一键清理」按钮。清理走同一 `/action` 通道（`scope: "ghost_ui"`），
+id/标题/出现位置，配「🧹 一键清理」按钮。**区块的计数/明细在每次页面加载时实时重算**
+（`codex_ui_state.refresh_codex_ghosts`，server 每次 GET / 都调，`build_report.py` 构建时调）
+——流程 Step 3 ② 在起报告前已清扫过时，页面显示的是清扫后的真实数量（通常为 0，区块整体
+隐藏），绝不拿扫描快照的旧计数误导用户；仅实时重算失败（文件损坏/DB 被锁）才回落快照值。
+清理走同一 `/action` 通道（`scope: "ghost_ui"`），
 **客户端不传任何 id**——ghost 集合由 `agent_delete.cleanup_codex_ui_ghosts()` 在执行时从
 threads 表 + 状态文件**实时重算**（绝不信任扫描快照，防止误删扫描后才新开的会话），规则=
 uuid 形态 ∧ 在白名单命名空间 ∧ 不在 threads 表。App 未退出、数据库被锁、文件非规范格式、
-并发改动任一命中都会整单拒绝且状态文件保持原样。会话行的 👻「侧栏残留」badge 表示该存活
-会话仍被状态文件引用（删除链路会在同一次操作里一并剪除）。
+并发改动任一命中都会整单拒绝且状态文件保持原样。存活会话不出「侧栏残留」badge：被状态
+文件引用是正常状态，删除链路会在删除时自动一并剪除，无需向用户提示。
 
 **幽灵清扫的三个时机**（保证任何清理动作之后侧栏都不留余鬼）：① 每个 Codex 删除按钮
 （单会话/整项目/孤儿批量）背后，剪除范围 = 被删 id ∪ 当前全部幽灵，一次写入；② 默认流程
@@ -332,7 +348,6 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
               "mtime": 0, "size": 0, "extra": {
                 "claude_kind": "session", // 真实 Claude session；0-jsonl 合成项为 orphan_dir
                 "cwd": "/path/from-jsonl-or-history-or-fallback", // 仅真实 Claude session
-                "codex_ui_residue": true, // 仅 codex：该存活会话仍被侧栏状态文件引用
                 // 仅 ZCode 会话另有：task_type（interactive|subagent_child）、parent_id、
                 // archived、task_status/model（来自 v2 任务索引）、zcode_live（10 分钟内活跃）
                 "multica": {            // 仅 Multica 会话
@@ -368,7 +383,7 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 session-analyzer/
 ├── SKILL.md
 ├── scripts/
-│   ├── scan.py                    # 只读扫描四 Agent → JSON（含 Codex 侧栏残留/幽灵标记）
+│   ├── scan.py                    # 只读扫描四 Agent → JSON（含 Codex 侧栏幽灵标记）
 │   ├── codex_ui_state.py          # Codex 侧栏状态文件唯一读写入口：解析/白名单剪除/门禁写
 │   ├── cleanup_claude_config.py   # 扫描后过滤 ~/.claude.json 顶层 projects
 │   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（默认执行）
@@ -393,10 +408,18 @@ session-analyzer/
   （Codex/ChatGPT 是闭源 Electron 应用，无公开删除协议可复刻），按「不确定则不做」原则，
   本 skill 不碰 `projects` 表。如需手工清理：退出 ChatGPT 后用 sqlite3 删除
   `projects` 中无任何 `threads.cwd` 引用的行（操作前自行备份 `state_5.sqlite`）。
-- **账号云同步可能拉回幽灵条目。** Codex 侧栏列表部分来自账号云端（跨设备同步）。本机
-  状态文件清理后重开 App，个别旧条目可能被云端重新拉回（点开仍报 no rollout found）。
-  这是预期内的残余风险：再次运行本 skill 清理即可；被云拉回且无法本地根除的条目，在
-  Codex 侧栏对条目手动删除一次（其原生删除会同步到云端），之后不会再回来。
+- **侧栏列表大量来自账号云端，本地剪除管不到（2026-09 实测的主行为，不再是边缘情况）。**
+  侧栏显示的会话 = 本地 threads ∪ 账号云端同步的会话（含其他设备/网页创建、本地从未有
+  threads 行和 rollout 的条目；同名会话在云端还可以有自己的 id，本地删掉本地副本后云端
+  副本依旧出现，点开报 no rollout found）。本地删除+剪除后重开 App，云端条目仍然在——
+  这不是删除失败，是数据在云端。本 skill 的剪除负责清光本地缓存残渣（描述/权限/输出目录
+  映射等），让侧栏不再从本地状态里拉出任何已删会话的痕迹。**云端条目的根除办法（注意：
+  侧栏右键/悬停菜单里没有删除项，这是 Codex 的已知设计，见 OpenAI 帮助文档
+  「How to archive and delete Codex chats」与 openai/codex#13018）：先归档、再到设置里删
+  ——① 悬停侧栏条目 → 标题旁 ⋯ 菜单 →「归档聊天」；② 设置 →「已归档聊天」→ 悬停条目
+  → 点垃圾桶图标确认删除（此步才删云端记录，30 天内从 OpenAI 系统彻底清除、不可恢复；
+  该页也有「全部归档/删除全部」的批量入口）。** 给用户转述 Codex 删除结果时应带上这两步
+  操作指引，不要说「在侧栏右键删除」——那个入口不存在。
 - **为什么 CLI `codex` 进程不参与运行门禁**：`.codex-global-state.json` 是 Electron 侧栏
   状态，只有 ChatGPT App（内嵌 Codex）/遗留独立 Codex App 会重写；Rust 的 `codex` CLI
   引擎不碰它。若把 CLI 进程也纳入 pgrep 门禁，日常 CLI 会话会让清理永远不可用。

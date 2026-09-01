@@ -120,18 +120,18 @@ def scan_codex() -> dict:
         return agent
 
     by_cwd: dict[str, list] = {}
-    # Codex Electron 侧栏状态文件（只读解析）：侧栏列表不读 DB，删了 DB 行侧栏仍会
-    # 留幽灵条目。这里给存活会话打 UI 残留标记，并把「UI 有 id 但 threads 表已无」的
-    # 纯幽灵单列计数；实际剪除只发生在删除链路（agent_delete / codex_ui_state）。
+    # Codex Electron 侧栏状态文件（只读解析）：存活会话被该文件引用是正常状态（权限/
+    # 描述/项目分配等元数据），不标任何「残留」badge——那只会误导用户。真正有意义的
+    # 信号只有「UI 有 id 但 threads 表已无」的纯幽灵，单列计数；实际剪除只发生在
+    # 删除链路（agent_delete / codex_ui_state）。
     ui_data = None
     try:
         ui_raw, _ = codex_ui_state.load_state_raw(root / codex_ui_state.STATE_NAME)
         ui_data = codex_ui_state.parse_state(ui_raw)
     except (OSError, codex_ui_state.CleanupRejected):
         ui_data = None  # 文件不存在 / 结构异常：跳过标记，不连累扫描
-    residue = codex_ui_state.residue_ids(ui_data) if ui_data is not None else None
     if ui_data is None:
-        agent["note"] += "（侧栏状态文件不可解析，本次未标注 codex_ui_residue / 幽灵条目）"
+        agent["note"] += "（侧栏状态文件不可解析，本次未标注幽灵条目）"
     for r in rows:
         tid = r["id"]
         cwd = r["cwd"] or ""
@@ -154,8 +154,6 @@ def scan_codex() -> dict:
         title = (r["title"] or "").strip()
         snippet = (r["first_user_message"] or r["preview"] or "").strip().replace("\n", " ")
         extra = {"source": r["source"], "archived": int(r["archived"] or 0)}
-        if residue is not None and tid in residue:
-            extra["codex_ui_residue"] = True  # 侧栏状态文件仍挂着这条会话（删除链路会一并剪除）
         by_cwd.setdefault(cwd, []).append({
             "id": tid,
             "title": title or "(无标题)",

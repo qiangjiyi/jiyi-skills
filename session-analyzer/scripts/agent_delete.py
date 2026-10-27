@@ -672,28 +672,6 @@ def _safe_remove(path: Path, mode: str, removed: list, errors: list) -> None:
         errors.append(f"{path}: {e}")
 
 
-def _projectless_workspace(cwd: str, docs_codex: Path, non_target_cwds: set) -> Path | None:
-    if not cwd:
-        return None
-    p = Path(cwd).expanduser()
-    try:
-        resolved = p.resolve()
-        rel = resolved.relative_to(docs_codex)
-    except (ValueError, OSError):
-        return None
-    if str(resolved) in non_target_cwds:
-        return None
-    if not rel.parts or not p.is_dir():
-        return None
-    return p
-
-
-def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    return con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone() is not None
-
-
 # ─────────────────────────── ZCode ───────────────────────────
 
 # 与 scan.py 的 ZCODE_LIVE_WINDOW_MS 保持一致：最近 10 分钟仍有更新的会话拒绝删除

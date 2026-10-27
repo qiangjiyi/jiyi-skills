@@ -392,8 +392,73 @@ _CODEX_DB_TARGETS = [
     ("logs_2.sqlite", [("logs", "thread_id")]),
     ("goals_1.sqlite", [("thread_goals", "thread_id")]),
     ("memories_1.sqlite", [("stage1_outputs", "thread_id")]),
-    ("sqlite/codex-dev.db", [("automation_runs", "thread_id"), ("inbox_items", "thread_id")]),
+    ("sqlite/codex-dev.db", [
+        ("automation_runs", "thread_id"), ("inbox_items", "thread_id"),
+        ("local_thread_catalog", "thread_id"), ("local_thread_catalog_scan_entries", "thread_id"),
+        ("thread_timeline_ledger", "thread_id"),
+    ]),
+    ("sqlite/codex-thread-summaries-dev.db", [("thread_turn_summaries", "thread_id")]),
+    ("thread_history_1.sqlite", [
+        ("thread_items", "thread_id"), ("thread_realtime_items", "thread_id"),
+        ("thread_history_projection_state", "thread_id"), ("thread_turns", "thread_id"),
+    ]),
 ]
+
+# 孤儿行清扫：thread_id 不在 threads 表即残渣。带 where 的表只清本机行，绝不碰账号云端 host
+# （local_thread_catalog 里有 chatgpt:<account> host 的行，那是云端目录缓存）。
+_CODEX_ORPHAN_SWEEPS = [
+    ("sqlite/codex-dev.db", "local_thread_catalog", "thread_id", "host_id = 'local'"),
+    ("sqlite/codex-dev.db", "local_thread_catalog_scan_entries", "thread_id", "host_id = 'local'"),
+    ("sqlite/codex-dev.db", "thread_timeline_ledger", "thread_id", "host_id = 'local'"),
+    ("sqlite/codex-dev.db", "inbox_items", "thread_id", "thread_id IS NOT NULL"),
+    ("sqlite/codex-dev.db", "automation_runs", "thread_id", "1=1"),
+    ("sqlite/codex-thread-summaries-dev.db", "thread_turn_summaries", "thread_id", "host_key LIKE 'local%'"),
+    ("thread_history_1.sqlite", "thread_items", "thread_id", "1=1"),
+    ("thread_history_1.sqlite", "thread_realtime_items", "thread_id", "1=1"),
+    ("thread_history_1.sqlite", "thread_history_projection_state", "thread_id", "1=1"),
+    ("thread_history_1.sqlite", "thread_turns", "thread_id", "1=1"),
+]
+
+
+def cleanup_codex_db_orphans() -> dict:
+    """清扫 Codex 各 SQLite 里 thread_id 已不在 threads 表的孤儿行（硬删，不可逆）。
+
+    门禁同 cleanup_codex_ui_ghosts：App 必须已退出、threads 表必须能 mode=ro 读到（读不到 =
+    有进程持锁 → fail closed，绝不据旧快照判孤儿）。活集合为空时拒绝（防止库异常时清空全部）。
+    幂等：第二次零命中。"""
+    if codex_ui_state.app_running() is not False:
+        raise ValueError("ChatGPT/Codex App 仍在运行（或无法确认已退出），已拒绝清理；请先完全退出。")
+    root = HOME / ".codex"
+    try:
+        live = codex_ui_state.live_thread_ids(root / "state_5.sqlite")
+    except sqlite3.Error as e:
+        raise ValueError(f"Codex 状态数据库暂不可读，已保守拒绝：{e}") from e
+    if not live:
+        raise ValueError("threads 表为空，无法可靠判定孤儿，已拒绝")
+    rows: dict = {}
+    for db_name, table, col, where in _CODEX_ORPHAN_SWEEPS:
+        db_path = root / db_name
+        if not db_path.exists():
+            continue
+        c = sqlite3.connect(db_path)
+        try:
+            if not _table_exists(c, table):
+                continue
+            ids = [r[0] for r in c.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {where}")
+                   if r[0] and r[0] not in live]
+            n = 0
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                n += c.execute(f"DELETE FROM {table} WHERE {col} IN ({q}) AND ({where})", chunk).rowcount
+            c.commit()
+            if n:
+                rows[f"{db_name}:{table}"] = n
+        except sqlite3.Error as e:
+            rows[f"{db_name}:{table}"] = f"error:{e}"
+        finally:
+            c.close()
+    return {"ok": True, "rows": rows, "removed_total": sum(v for v in rows.values() if isinstance(v, int))}
 
 
 def delete_codex_threads(ids: list, mode: str = "rm") -> dict:
@@ -806,6 +871,15 @@ def main() -> int:
             file=sys.stderr)
     else:
         print("[codex-ui] 无幽灵条目，no-op", file=sys.stderr)
+    try:
+        o = cleanup_codex_db_orphans()
+    except ValueError as e:
+        print(f"[codex-db] 已拒绝：{e}", file=sys.stderr)
+        return 1
+    if o["removed_total"]:
+        print(f"[codex-db] 已清扫孤儿行 {o['removed_total']} 条：{o['rows']}", file=sys.stderr)
+    else:
+        print("[codex-db] 无孤儿行，no-op", file=sys.stderr)
     print("✓ DONE")
     return 0
 

@@ -631,7 +631,9 @@ class CliMainTest(unittest.TestCase):
     """流程默认清扫的 CLI 入口（SKILL.md Step 3 ② 调用的命令）。"""
 
     def test_runs_and_reports_sweep(self):
-        with mock.patch.object(agent_delete, "cleanup_codex_ui_ghosts",
+        with mock.patch.object(agent_delete, "cleanup_codex_db_orphans",
+                               return_value={"ok": True, "rows": {}, "removed_total": 0}), \
+             mock.patch.object(agent_delete, "cleanup_codex_ui_ghosts",
                                return_value={"ok": True, "ghosts_found": 2,
                                              "removed_total": 6, "backup_created": True}):
             with mock.patch("sys.argv", ["agent_delete.py", "--codex-ghosts"]):
@@ -646,6 +648,64 @@ class CliMainTest(unittest.TestCase):
     def test_no_flags_prints_help_and_fails(self):
         with mock.patch("sys.argv", ["agent_delete.py"]):
             self.assertEqual(agent_delete.main(), 1)
+
+
+class DbOrphanSweepTest(unittest.TestCase):
+    """cleanup_codex_db_orphans：只清本机孤儿行，云端 host 行与存活会话原样保留。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        root = self.home / ".codex"
+        (root / "sqlite").mkdir(parents=True)
+        c = sqlite3.connect(root / "state_5.sqlite")
+        c.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+        c.execute("INSERT INTO threads VALUES ('live')")
+        c.commit(); c.close()
+        c = sqlite3.connect(root / "sqlite" / "codex-dev.db")
+        c.execute("CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT)")
+        c.executemany("INSERT INTO local_thread_catalog VALUES (?,?)",
+                      [("local", "live"), ("local", "gone"), ("chatgpt:acct", "cloud")])
+        c.commit(); c.close()
+        c = sqlite3.connect(root / "thread_history_1.sqlite")
+        c.execute("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT)")
+        c.executemany("INSERT INTO thread_turns VALUES (?,?)", [("live", "a"), ("gone", "b")])
+        c.commit(); c.close()
+        for m in (mock.patch.object(agent_delete, "HOME", self.home),
+                  mock.patch.object(codex_ui_state, "app_running", return_value=False)):
+            m.start(); self.addCleanup(m.stop)
+
+    def _rows(self, db, sql):
+        c = sqlite3.connect(self.home / ".codex" / db)
+        try:
+            return sorted(r[0] for r in c.execute(sql))
+        finally:
+            c.close()
+
+    def test_sweeps_local_orphans_only(self):
+        r = agent_delete.cleanup_codex_db_orphans()
+        self.assertEqual(r["removed_total"], 2)
+        self.assertEqual(self._rows("sqlite/codex-dev.db", "SELECT thread_id FROM local_thread_catalog"),
+                         ["cloud", "live"])
+        self.assertEqual(self._rows("thread_history_1.sqlite", "SELECT thread_id FROM thread_turns"), ["live"])
+
+    def test_idempotent(self):
+        agent_delete.cleanup_codex_db_orphans()
+        self.assertEqual(agent_delete.cleanup_codex_db_orphans()["removed_total"], 0)
+
+    def test_refuses_when_app_running(self):
+        with mock.patch.object(codex_ui_state, "app_running", return_value=True):
+            with self.assertRaises(ValueError):
+                agent_delete.cleanup_codex_db_orphans()
+        self.assertEqual(self._rows("thread_history_1.sqlite", "SELECT thread_id FROM thread_turns"),
+                         ["gone", "live"])
+
+    def test_refuses_when_no_live_threads(self):
+        c = sqlite3.connect(self.home / ".codex" / "state_5.sqlite")
+        c.execute("DELETE FROM threads"); c.commit(); c.close()
+        with self.assertRaises(ValueError):
+            agent_delete.cleanup_codex_db_orphans()
 
 
 if __name__ == "__main__":

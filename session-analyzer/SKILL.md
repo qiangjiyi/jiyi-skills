@@ -234,7 +234,7 @@ bash scripts/run.sh precleanup.py        # 默认移废纸篓（可逆）；--ha
 ```
 
 ```bash
-bash scripts/run.sh agent_delete.py --codex-ghosts   # Codex 侧栏幽灵清扫（App 已退出，门禁可过）
+bash scripts/run.sh agent_delete.py --codex-ghosts   # Codex 侧栏幽灵清扫 + 各 SQLite 孤儿行清扫（App 已退出，门禁可过）
 ```
 
 清掉四个 Agent 历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
@@ -271,7 +271,7 @@ disown
 脚本自带单实例约束，重复起会自动接管旧实例。用完让用户 `kill <pid>` 停（停掉后删除按钮即失效）。
 
 `server.py` 起在 127.0.0.1 + 随机端口 + 随机 token，把同一套模板注入启用态 `__DELETE_CONFIG__`。
-三栏对比三个 Agent，可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
+四栏对比四个 Agent，可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
 每个 Agent 有「🧹 一键清理 N 个孤儿会话」。删除默认移废纸篓（可逆），Codex/索引类硬删项会红色
 二次确认。删除经 `agent_delete.py`，复刻各 Agent 原始清理工具的 removal set（Codex 行+jsonl+
 卫星文件+侧栏状态剪除、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
@@ -374,7 +374,7 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 两者同构（一模板两入口、扫描只读、网页可一键删），互补之处在范围：
 
 - `storage-analyzer`：扫整机磁盘，按 `🟢自动清理 / 🟡需判断 / 🔴谨慎清理` 给出可执行处置。
-- `session-analyzer`（本 skill）：只扫三个 AI Agent 的会话数据，按「Agent → 项目 → 会话」
+- `session-analyzer`（本 skill）：只扫四个 AI Agent 的会话数据，按「Agent → 项目 → 会话」
   盘点占用，网页上按会话/项目删除，复刻各 Agent 原始清理工具的 removal set。
 
 ## 文件结构
@@ -402,6 +402,24 @@ session-analyzer/
 ```
 
 ## Codex 侧栏幽灵条目：边界与已知残余风险
+
+- **2026-10 新增存储（thread_id 孤儿行由 `cleanup_codex_db_orphans()` 清扫，`--codex-ghosts`
+  同时执行）。** 删会话与孤儿清扫共用同一份目标表：`sqlite/codex-dev.db` 的
+  `local_thread_catalog`（新版侧栏目录）/ `local_thread_catalog_scan_entries` /
+  `thread_timeline_ledger` / `inbox_items` / `automation_runs`，`sqlite/codex-thread-summaries-dev.db`
+  的 `thread_turn_summaries`，`thread_history_1.sqlite` 的 `thread_turns` / `thread_items` /
+  `thread_realtime_items` / `thread_history_projection_state`。判定 = thread_id 不在
+  `state_5.sqlite.threads`；`local_thread_catalog` 与 ledger 只清 `host_id='local'`，
+  summaries 只清 `host_key LIKE 'local%'`——目录里有 `chatgpt:<account>:...` 的**云端 host 行**，
+  绝不碰。门禁同幽灵清扫：App 必须已退出、threads 表须可 `mode=ro` 读、活集合为空则拒绝。
+  这些表**不决定侧栏显示什么**（实测侧栏幽灵 0 时它们仍有孤儿），清它们只是释放空间/去残渣。
+- **侧栏仍显示、点开报不存在 = 云端条目，先查本地再下结论。** 先看 scan 的
+  `ghost_ui_entry_count` 与 `local_thread_catalog`：都为 0 就不是本地问题，给用户转述
+  「悬停条目 ⋯ →「归档聊天」→ 设置 →「已归档聊天」→ 垃圾桶删除」两步。相关上游 issue：
+  openai/codex #53720（侧栏条目删不掉）、#53937（侧栏保留已不存在会话的引用）。
+- `~/.codex/sqlite/state_5.sqlite`（2026-06 的旧副本）不是现行库，scan/删除只用
+  `~/.codex/state_5.sqlite`；`~/.codex/..codex-global-state.json.tmp-*` 与 `.bak` 是 App 遗留，
+  本 skill 不处理。
 
 - **`state_5.sqlite` 的 `projects` 行不自动删除。** 项目下所有会话删光后 `projects` 行会
   残留，侧栏项目分组随之残留；但无法在本机确证 Codex 原生删除是否清理这些行

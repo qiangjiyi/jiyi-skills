@@ -36,6 +36,12 @@ mcp_alive() {
     2>/dev/null | grep -q '"capabilities"'
 }
 
+# v260907 起 MCP 默认关闭，且开关只在本次运行期间有效，每次启动后都要打开
+enable_mcp() {
+  curl -s --noproxy '*' --max-time 5 -X POST "http://127.0.0.1:${PORT}/api/mcp/enable" \
+    -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1
+}
+
 cmd_status() {
   if listening; then
     pids=$(pgrep -f "$BIN" | tr '\n' ' ')
@@ -51,6 +57,10 @@ cmd_start() {
     echo "后端已在运行，MCP 正常"
     return 0
   fi
+  if listening; then
+    enable_mcp
+    mcp_alive && { echo "后端已在运行，已开启 MCP"; return 0; }
+  fi
   local d
   d=$(backend_dir)
   [ -z "$d" ] && { echo "未找到已安装的后端，请先运行: wx-video update"; return 1; }
@@ -61,7 +71,10 @@ cmd_start() {
     (cd "$d" && nohup "./$BIN" >> app.log 2>&1 &)
   fi
   for i in $(seq 1 20); do  # 最多等 10 秒
-    listening && mcp_alive && { echo "后端已就绪，MCP $MCP_URL"; return 0; }
+    if listening; then
+      mcp_alive || enable_mcp
+      mcp_alive && { echo "后端已就绪，MCP $MCP_URL"; return 0; }
+    fi
     sleep 0.5
   done
   echo "启动超时，查看日志: $d/app.log" >&2

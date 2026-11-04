@@ -15,6 +15,8 @@ set -u
 BASE="$HOME/.local/share/qiaomu-wx-video/backend"
 CURRENT="$BASE/current"   # 指向当前版本目录的符号链接，update 时只切换它
 SNAPSHOT="$BASE/.proxy-snapshot.tsv"
+WATCHDOG_PID="$BASE/.watchdog.pid"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BIN="wx_video_download"
 REPO="ltaoo/wx_channels_download"
 # GitHub 访问失败时的代理回退；WX_VIDEO_PROXY 可覆盖（如 http://127.0.0.1:7890）
@@ -112,10 +114,34 @@ clear_stale_proxy() {
   done
 }
 
+# ============ 异常退出兜底 ============
+
+# 后台模式下与后端一起启动的看门狗：后端被强杀 / 崩溃时立即按快照恢复系统代理，
+# 避免系统代理一直指向已无人监听的 2023，导致走系统代理的应用全部断网。
+# 关机或注销时收到 TERM/HUP 也会恢复。正常 stop 会先用 KILL 结束它，由 stop 自己恢复。
+watchdog() {
+  local pid=$1
+  echo $$ > "$WATCHDOG_PID"
+  trap 'echo "[watchdog] 收到退出信号，恢复系统代理"; restore_proxy; rm -f "$WATCHDOG_PID"; exit 0' TERM HUP INT
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 2 & wait $!   # 让 trap 能立即响应，而不是等 sleep 结束
+  done
+  echo "[watchdog] 后端 (PID $pid) 已退出且未经 wx-video stop，恢复系统代理"
+  restore_proxy
+  rm -f "$WATCHDOG_PID"
+}
+
+stop_watchdog() {
+  [ -f "$WATCHDOG_PID" ] || return 0
+  kill -KILL "$(cat "$WATCHDOG_PID")" 2>/dev/null
+  rm -f "$WATCHDOG_PID"
+}
+
 # ============ 服务生命周期 ============
 
 stop_backend() {
   local pids
+  stop_watchdog
   pids=$(backend_pids)
   if [ -z "$pids" ]; then
     echo "后端未在运行"
@@ -148,10 +174,12 @@ start_detached() {
   [ -z "$d" ] && { echo "未找到已安装的后端"; return 1; }
   snapshot_proxy
   # start_new_session 让后端进入全新会话/进程组：启动它的终端或脚本被整组杀掉时不受牵连
+  # 看门狗同样放进独立会话，日志写入 app.log
   (cd "$d" && /usr/bin/python3 -c 'import subprocess,sys
 f=open("app.log","ab",0)
-subprocess.Popen(["./wx_video_download"], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)')
-  echo "后端已在后台启动，管理页: http://127.0.0.1:2022/ （停止时执行 wx-video stop 会按快照恢复代理）"
+p=subprocess.Popen(["./wx_video_download"], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+subprocess.Popen([sys.argv[1], "_watchdog", str(p.pid)], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)' "$SELF")
+  echo "后端已在后台启动，管理页: http://127.0.0.1:2022/ （停止时执行 wx-video stop 会按快照恢复代理；后端异常退出时看门狗会自动恢复）"
 }
 
 # 前台运行：Ctrl+C 退出后立即按快照恢复代理（不再依赖下次 stop 补救）
@@ -163,13 +191,14 @@ run_foreground() {
   echo "微信里打开视频号视频 → 等视频开始播放并暂停 → 点下载按钮选清晰度；完成后 Ctrl+C 退出并恢复代理"
   "./$BIN" &
   child=$!
-  trap 'kill -INT "$child" 2>/dev/null' INT TERM
+  # HUP：直接关掉终端窗口时也要走到下面的 restore_proxy
+  trap 'kill -INT "$child" 2>/dev/null' INT TERM HUP
   rc=0
   while kill -0 "$child" 2>/dev/null; do
     wait "$child"
     rc=$?
   done
-  trap - INT TERM
+  trap - INT TERM HUP
   restore_proxy
   exit "$rc"
 }
@@ -248,6 +277,9 @@ case "${1:-}" in
     ;;
   update)
     do_update
+    ;;
+  _watchdog)  # 内部命令，由 start --detach 启动
+    watchdog "$2"
     ;;
   ""|start|restart)
     dir=$(backend_dir)

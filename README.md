@@ -14,7 +14,8 @@
 [**`skill-doctor`**](skill-doctor) — Skill 工作流诊断 ·
 [**`wechat-article-production`**](wechat-article-production) — 公众号文章生产 ·
 [**`xhs-card-publisher`**](xhs-card-publisher) — 小红书知识卡生成 ·
-[**`jiyi-little-dancer-illustrations`**](jiyi-little-dancer-illustrations) — 小舞伴 IP 配图
+[**`jiyi-little-dancer-illustrations`**](jiyi-little-dancer-illustrations) — 小舞伴 IP 配图 ·
+[**`agent-orchestrator`**](agent-orchestrator) — 多 Agent 编排
 
 <br/>
 
@@ -40,12 +41,13 @@ jiyi-skills/
 ├── wechat-article-production/        # ✅ 已开源
 ├── xhs-card-publisher/               # ✅ 已开源
 ├── jiyi-little-dancer-illustrations/ # ✅ 已开源
+├── agent-orchestrator/               # ✅ 已开源
 └── README.md
 ```
 
 > 每个 skill 直接放在仓库根目录下，一个目录一个 skill，不再额外嵌套 `skills/` 层。
 
-> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer`、`skill-updater`、`lark-doc-copy`、`wx-video-downloader`、`skill-doctor`、`wechat-article-production`、`xhs-card-publisher` 和 `jiyi-little-dancer-illustrations`，其余仍在本地迭代。
+> 这是我个人长期维护的 skills 仓库，会逐步沉淀更多 skill。目前已开源 `session-analyzer`、`skill-updater`、`lark-doc-copy`、`wx-video-downloader`、`skill-doctor`、`wechat-article-production`、`xhs-card-publisher`、`jiyi-little-dancer-illustrations` 和 `agent-orchestrator`，其余仍在本地迭代。
 
 ---
 

@@ -55,6 +55,14 @@
   .badge.orphan{background:var(--orphan-bg);color:var(--orange)}
 .badge.multica{background:#e8f3ff;color:var(--accent)}
 .badge.multica-active{background:#fff7e8;color:var(--orange)}
+.badge.cloud{background:#f2f3f5;color:var(--sub)}
+.badge.live{background:#e8ffea;color:var(--green)}
+  .host{border-radius:10px;padding:12px 16px;font-size:14px;margin-top:10px;background:#f2f3f5}
+  .host.avoid{background:#fff1f0;color:#cb2634}
+  .host.recommended{background:#e8ffea;color:#009a29}
+  .note.run{background:#fff1f0;color:#cb2634}
+  .note.mem{background:#f7f8fa;color:var(--sub)}
+  .offlist{font-size:12px;color:var(--sub);margin:-6px 0 14px}
   .pmeta{font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;white-space:nowrap}
 
   .srow{display:flex;align-items:center;gap:10px;padding:9px 14px 9px 30px;border-top:1px dashed var(--line);font-size:13px}
@@ -105,9 +113,11 @@
   <header>
     <h1>会话分析报告</h1>
     <div class="meta" id="meta"></div>
+    <div class="host" id="host"></div>
     <div class="lead" id="lead"></div>
   </header>
   <div class="overview" id="overview"></div>
+  <div class="offlist" id="offlist"></div>
   <div class="totals" id="totals"></div>
   <div id="sections"></div>
 </div>
@@ -117,10 +127,12 @@
 <script>
 const DATA = __REPORT_DATA__;
 const CFG  = __DELETE_CONFIG__;
-const ICON = {codex:"🟦", antigravity:"🛰️", claude:"🟧", zcode:"🟩"};
+// 图标 / 是否硬删来自扫描 JSON（agent_registry 注入）；旧快照没有这些字段时回落到内置表
+const ICON_FALLBACK = {codex:"🟦", antigravity:"🛰️", claude:"🟧", zcode:"🟩"};
+const agentOf = k => DATA.agents.find(x=>x.key===k)||{};
+const ICON = new Proxy({}, {get:(_,k)=> agentOf(k).icon || ICON_FALLBACK[k] || "🤖"});
 // 会话定义含数据库行的 Agent：删除不可逆（DB 行没法进废纸篓），UI 红色警示
-const HARD_DELETE_AGENTS = ["codex", "zcode"];
-const isHard = a => HARD_DELETE_AGENTS.includes(a);
+const isHard = a => { const x=agentOf(a); return x.hard_delete!==undefined ? !!x.hard_delete : ["codex","zcode"].includes(a); };
 const agentName = a => (DATA.agents.find(x=>x.key===a)||{}).name || a;
 
 function fmt(b){ if(b<1024) return b+" B"; const u=["KB","MB","GB","TB"]; let i=-1,n=b;
@@ -172,27 +184,37 @@ function render(){
   document.getElementById("meta").textContent =
     `扫描时间 ${fdate(DATA.generated_at)} · 耗时 ${DATA.scan_seconds}s · 命中 ${installed().length} 个 Agent`
     + (CFG&&CFG.enabled? " · 删除已启用（默认移废纸篓）" : " · 只读报告");
-  renderLead(); renderOverview(); renderTotals(); renderSections();
+  renderHost(); renderLead(); renderOverview(); renderTotals(); renderSections();
 }
 
+function renderHost(){
+  const h=DATA.host, box=document.getElementById("host");
+  if(!h){ box.style.display="none"; return; }
+  box.className = "host " + (h.fit||"");
+  const tail = h.fit==="recommended" ? "（推荐宿主）"
+    : h.fit==="avoid" ? `。建议改在 <b>${esc(h.recommended_name)}</b> 里运行本 skill，否则 ${esc(h.name)} 自己的会话无法清理。`
+    : `。推荐宿主是 <b>${esc(h.recommended_name)}</b>。`;
+  box.innerHTML = `${h.fit==="avoid"?"⚠️":"🧭"} 本次运行宿主：<b>${esc(h.name)}</b> —— ${esc(h.reason)}${tail}`;
+}
 function renderLead(){
   let max=null;
   installed().forEach(a=>{ if(!max||a.total_size>max.total_size) max=a; });
   const orphans = installed().reduce((s,a)=>s+(a.orphan_session_count||0),0);
   const lead=document.getElementById("lead");
   if(!max){ lead.style.display="none"; return; }
-  lead.innerHTML = `占用最大的是 <b>${max.name}</b>（${fmt(max.total_size)} / ${max.session_count} 个会话）。`
+  const unit = a => a.kind==="cloud" ? "个本地缓存项" : "个会话";
+  lead.innerHTML = `占用最大的是 <b>${max.name}</b>（${fmt(max.total_size)} / ${max.session_count} ${unit(max)}）。`
     + (orphans? ` ${installed().length} 个 Agent 合计 <b class="orphan" style="color:var(--orange)">${orphans}</b> 个孤儿会话，建议优先检查和清理。` : "");
 }
 
 function renderOverview(){
   const ov=document.getElementById("overview"); ov.innerHTML="";
-  DATA.agents.forEach(a=>{
-    if(!a.installed){ ov.appendChild(el(`<div class="ocard off"><div class="name">${ICON[a.key]||""} ${esc(a.name)}</div>
-      <div class="big">—</div><div class="sub">未检测到（已跳过）</div></div>`)); return; }
-    ov.appendChild(el(`<div class="ocard"><div class="name">${ICON[a.key]||""} ${esc(a.name)}</div>
+  const off = DATA.agents.filter(a=>!a.installed).map(a=>a.name);
+  document.getElementById("offlist").textContent = off.length ? "未检测到（已跳过）：" + off.join("、") : "";
+  installed().forEach(a=>{
+    ov.appendChild(el(`<div class="ocard"><div class="name">${ICON[a.key]||""} ${esc(a.name)}${a.kind==="cloud"?` <span class="badge cloud">☁️ 云端型</span>`:""}</div>
       <div class="big">${fmt(a.total_size)}</div>
-      <div class="sub">${a.project_count} 个项目 · ${a.session_count} 个会话`
+      <div class="sub">${a.kind==="cloud" ? `${a.session_count} 个本地缓存项（会话在云端）` : `${a.project_count} 个项目 · ${a.session_count} 个会话`}`
       + (a.orphan_session_count? ` · <span class="orphan">${a.orphan_session_count} 孤儿</span>`:"")
       + (a.ghost_ui_entry_count? ` · <span class="orphan">👻 ${a.ghost_ui_entry_count} 侧栏幽灵</span>`:"")
       + `</div></div>`));
@@ -232,7 +254,13 @@ function renderSections(){
       <div class="left"><div class="title">${ICON[a.key]||""} ${esc(a.name)}</div>
         <div class="root">${esc(a.root)}</div></div>
       <div class="nums">${a.project_count} 项目 · ${a.session_count} 会话 · ${fmt(a.total_size)}${orphanBulk}${multicaBulk}</div></div>`));
+    if(a.running_apps && a.running_apps.length)
+      sec.appendChild(el(`<div class="note run">🔴 ${esc(a.running_apps.join("、"))} 正在运行 —— 删除会被拒绝，请先退出后刷新本页。</div>`));
+    else if(a.running_apps===null && (a.must_close||[]).length)
+      sec.appendChild(el(`<div class="note run">⚠️ 无法读取进程列表，${esc(a.name)} 的删除会被保守拒绝。</div>`));
     if(a.note) sec.appendChild(el(`<div class="note">⚠️ ${esc(a.note)}</div>`));
+    if((a.memory||[]).length)
+      sec.appendChild(el(`<div class="note mem">🛡 记忆永久保留，不会被删除：${esc(a.memory.join("、"))}</div>`));
     const ghostBlock = ghostBlockEl(a);
     if(ghostBlock) sec.appendChild(ghostBlock);
     if(!a.projects.length){ sec.appendChild(el(`<div class="empty">暂无会话</div>`)); box.appendChild(sec); if(ghostBlock) bindGhost(sec,a); return; }
@@ -309,6 +337,11 @@ function sessionEl(a, pi, si){
   if(x.task_type==="subagent_child") tags+=`<span class="tag">子代理</span>`;
   if(x.task_status) tags+=`<span class="tag">${esc(x.task_status)}</span>`;
   if(x.zcode_live) tags+=`<span class="badge multica-active">🟢 运行中，暂不可删</span>`;
+  if(x.live) tags+=`<span class="badge live">🟢 10 分钟内活跃</span>`;
+  if(x.draft) tags+=`<span class="tag">草稿</span>`;
+  if(x.temp_workdir) tags+=`<span class="tag">临时目录</span>`;
+  if(x.db_missing) tags+=`<span class="tag">索引缺失</span>`;
+  if(x.cloud_cache) tags+=`<span class="tag">${x.empty_only?"清空内容":"整目录"}</span>`;
   if(x.multica && x.multica.status==="active") tags+= `<span class="badge multica-active">⚠️ Multica 不建议清理</span>`;
   const delBtn=(CFG&&CFG.enabled)?`<button class="del" data-act="sess">删除</button>`:"";
   const row=el(`<div class="srow">

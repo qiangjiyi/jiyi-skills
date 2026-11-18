@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""开场兜底清理：在只读扫描之前，清掉三个 Agent 历史遗留的空目录，以及 Claude
+"""开场兜底清理：清掉各 Agent 会话数据子树里历史遗留的空目录，以及 Claude
 session-env / file-history / tasks 里「对应会话已不存在」的卫星孤儿。
 
 为什么需要：删会话只删会话本体，逐会话删不收空了的 projects/<dir>、Codex 删 rollout
@@ -15,6 +15,7 @@ import argparse
 import sys
 
 import agent_delete as ad
+import agents_workbuddy
 from pathlib import Path
 
 
@@ -31,14 +32,17 @@ def main() -> int:
     keep |= ad._antigravity_live_uuids(Path.home() / ".gemini" / "antigravity")
     # ZCode 活跃会话的卫星目录同理（exec/sess_* 常常是恰好为空的合法目录）
     keep |= ad._zcode_live_sids()
+    keep |= agents_workbuddy.live_sids()  # WorkBuddy 现存会话的卫星目录同理
     keep_paths = ad._claude_live_memory_dirs()  # 仅护「仍有会话」项目的 memory，孤立壳可回收
     ad.prune_empty_dirs(all_roots, mode, removed, keep, keep_paths)
     orphans = ad.prune_claude_satellites(mode, removed)
     stale_state = ad.prune_claude_session_state(mode, removed)
+    wb_orphans = agents_workbuddy.prune_orphans(mode, removed)  # App 运行中自动跳过
 
     where = "已删除" if args.hard else "已移入废纸篓"
     print(f"[precleanup] {where}：残渣 {len(removed)} 项"
-          f"（其中 Claude 卫星孤儿 {len(orphans)} 个、陈旧进程状态文件 {len(stale_state)} 个）。",
+          f"（其中 Claude 卫星孤儿 {len(orphans)} 个、陈旧进程状态文件 {len(stale_state)} 个、"
+          f"WorkBuddy 卫星孤儿 {len(wb_orphans)} 个）。",
           file=sys.stderr)
     for p in removed:
         print(f"  - {p}", file=sys.stderr)

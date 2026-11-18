@@ -1,21 +1,23 @@
 ---
 name: session-analyzer
 description: >
-  AI Agent 会话分析助手。只读扫描本机 Codex、Antigravity、Claude Code、ZCode 四个
-  Agent 累积的会话/对话/任务数据，按「Agent → 项目 → 会话」三级层级统计各层占用空间
+  AI Agent 会话分析助手。自动探测本机装了哪些 AI Agent（Codex、Antigravity、Claude Code、
+  ZCode、WorkBuddy、Cursor、Gemini CLI、豆包、Grok Bot），只读扫描它们累积的会话/对话/任务数据，按「Agent → 项目 → 会话」三级层级统计各层占用空间
   与会话数量，标记工作目录已删除的孤儿会话，生成排版精美的交互式 HTML 报告，并可起
-  本地服务在网页上按会话/按项目一键删除（默认移废纸篓、可逆）。扫描全程只读。
+  本地服务在网页上按会话/按项目一键删除（会话日志、数据库行、索引、产物与临时目录一并清，
+  记忆文件永远保留；默认移废纸篓、可逆）。扫描全程只读。推荐在 ZCode 里运行。
   务必在以下场景使用：用户说"会话太多""对话记录太多""Codex/Antigravity/Claude/
   ZCode 会话占空间""AI Agent 历史""项目删了会话还在""孤儿会话""session cleanup"
-  "Codex 侧栏还有旧标题""no rollout found""幽灵条目""侧栏残留"、
+  "Codex 侧栏还有旧标题""no rollout found""幽灵条目""侧栏残留"、"WorkBuddy/Cursor/豆包
+  会话太多""清理各个 Agent 的会话"、
   想看哪个 Agent 的会话最占地方，或想批量盘点某个项目的会话情况时。
-  注意：本 skill 针对四个 AI Agent 的会话数据，不是整机磁盘分析（那是
+  注意：本 skill 针对 AI Agent 的会话数据，不是整机磁盘分析（那是
   storage-analyzer，二者互补）。
 ---
 
 # Session Analyzer
 
-对本机四个 AI Agent（Codex / Antigravity / Claude Code / ZCode）的会话数据做一次只读分析，
+自动探测本机已安装的 AI Agent（见下方「支持的 Agent 与宿主建议」），对它们的会话数据做一次只读分析，
 依据扫描快照同步清理 `~/.claude.json` 中没有真实 session 的项目配置，再生成交互式 HTML 报告并可在网页上一键删除。**确定性管线：只读扫描 → Claude 配置清理 → 固定决策 → 固定执行**
 （关 app / 兜底清理 / 报告形态都按写死的默认值跑，不再用 AskUserQuestion 询问；仅当用户主动要求偏离时才调整对应项）。
 
@@ -23,6 +25,33 @@ description: >
 `__DELETE_CONFIG__` 决定渲染成只读还是带删除按钮——`build_report.py` 注入 `null`（静态、
 `file://` 双击、无删除），`server.py` 注入真实 `{token, endpoint, enabled}`（起本地服务、
 有删除按钮）。
+
+## 支持的 Agent 与宿主建议
+
+Agent 清单、关闭策略、记忆保护名单、宿主判定全部收在 `scripts/agent_registry.py`（唯一事实来源）。
+`scan.py` 运行时按 `detect` 路径自动探测，未装的跳过并在报告底部列出；报告顶部显示**本次运行宿主**
+（进程祖先链判定）是否合适。
+
+| Agent | 会话数据 | 清理前必须退出 | 在它里面运行本 skill |
+|---|---|---|---|
+| ZCode | `~/.zcode` SQLite | 否（10 分钟内活跃会话拒删） | ✅ **推荐** |
+| Claude Code | `~/.claude/projects/*.jsonl` | 否 | 可以 |
+| Gemini CLI | `~/.gemini/tmp/*/chats/session-*.json` | 否 | 可以 |
+| Codex | `~/.codex` SQLite + rollout + 侧栏状态 | **ChatGPT** | ❌ 关 ChatGPT 会连带退出 |
+| Antigravity | `~/.gemini/antigravity` | **Antigravity** | ❌ |
+| WorkBuddy | `~/.workbuddy` jsonl + `workbuddy.db` + 侧栏快照 | **WorkBuddy** | ❌ |
+| Cursor | IDE `state.vscdb` / CLI `~/.cursor/chats` | **Cursor**（仅 IDE 会话） | ❌（cursor-agent CLI 里可删 IDE 会话） |
+| 豆包 ☁️ | 云端；本地只有加密缓存 | **豆包** | ❌ |
+| Grok Bot ☁️ | 云端；本地只有缓存 | **Grok Bot** | ❌ |
+
+- **宿主永不被关闭**：`close_agents.py` 发现某个要关的 App 就是宿主时跳过它，该 Agent 本次的删除会被
+  门禁拒绝——这时直接建议用户换到 ZCode 里重跑。
+- **云端型（☁️）**：会话存在云端、本地消息库加密，列不出会话；报告只列「会话生成的本地工作目录 /
+  日志 / 临时缓存」可清理，并提示云端会话要在各自 App 内删除。
+- **记忆永远保留**：每个 Agent 的记忆/身份文件（`agent_registry` 的 `memory` 字段，报告里 🛡 行展示）
+  不在任何删除链路里；WorkBuddy 临时工作目录里非空的 `.workbuddy/memory/` 也会保留。
+- **新增 Agent**：在 `agent_registry.AGENTS` 加一条 spec，写 `agents_<key>.py`（`scan()` / `delete()`），
+  在 `scan.py` 的 `SCANNERS` 与 `server.py` 的 `dispatch` 各加一行，再补测试。
 
 ## 铁律
 
@@ -44,7 +73,11 @@ description: >
 - **删除安全模型（server.py）。** 绑 127.0.0.1 + 随机端口 + 随机 token；每个 POST 校验
   token + Host（挡 DNS-rebinding）；只接受扫描里存在的 `(agent, scope, project_id, session_id)`，
   客户端无法指定任意路径/id；每个处理器只碰该 Agent 自己的数据目录。
-- **默认移废纸篓（可逆）。** 文件级删除走废纸篓；但 **Codex 与 ZCode 的 DB 行 / jsonl
+- **新增 Agent 的运行门禁。** WorkBuddy / Cursor IDE / 豆包 / Grok Bot 的删除处理器开头都调
+  `agent_registry.require_closed()`：App 仍在运行或读不到进程表一律拒绝（运行中会把数据写回）。
+  Cursor CLI 会话与 ZCode 一样，10 分钟内有更新即拒删。删除 id 只接受 UUID / 扫描时生成的固定
+  id，路径由服务端重算，客户端无法指定路径。
+- **默认移废纸篓（可逆）。** 文件级删除走废纸篓；但 **Codex、ZCode、WorkBuddy、Cursor 的 DB 行 /
   索引行天生硬删**（数据库行没法进废纸篓），Antigravity 侧栏索引 `agyhub_summaries_proto.pb`
   同样就地硬改——这些不可逆，UI 已用红色警示并二次确认。
 - **Codex 侧栏状态文件（`.codex-global-state.json`）剪除纪律。** 它被运行中的 ChatGPT
@@ -96,7 +129,7 @@ bash scripts/run.sh scan.py --json-out /tmp/session_scan.json
 > `can't open file '.../scripts/scan.py'`。`scripts/run.sh` 自定位 skill 根再 exec，
 > 从任何 cwd 都能跑。下面 ① / ② / ③ 同理。
 
-`scan.py` 自动探测四个 Agent 是否安装（数据目录是否存在），未装则跳过并标注。产出统一
+`scan.py` 按 `agent_registry` 自动探测各 Agent 是否安装（数据目录是否存在），未装则跳过并标注；单个 Agent 扫描异常只标注「扫描失败」、不拖垮整体。产出统一
 JSON：每个 Agent → 项目 → 会话三级，含每层 size、会话数、mtime、摘要、孤儿标记。
 
 `scan.py` 在 stderr 还会打一行自检 `[scan] agents=N sessions=... orphans=... size=...
@@ -133,6 +166,25 @@ in X.Xs`，方便 agent 区分「真扫到 0」vs「扫坏了」。脚本末行�
   卫星/索引行单列「孤儿残留」。不归属单会话的数据（`cli/log/`、`exec/shell-snapshots`、
   `v2/checkpoints|logs|crash` 等）不扫。最近 10 分钟内仍有更新的会话标记 `extra.zcode_live`
   且删除被拒绝（防止删到正在运行的会话——删除 zcode 会话无需也无法先关 zcode 进程）。
+
+- **WorkBuddy**（`~/.workbuddy/`）：会话 = `workbuddy.db.sessions` 本地行 ∪ `projects/<编码cwd>/<sid>.jsonl`
+  （云端行只计数）；项目按 cwd 聚合。删除集合 = jsonl + `<sid>/` + `.file-rollback.ndjson` + `.meta.json`、
+  `file-history/<sid>`、`artifact-index/<sid>.json`（只删索引，不删它指向的产物）、
+  `file-tree-manifests/<sid>.json`、`workspace/sessions/<sid>`，DB 行（sessions / session_usage /
+  session_turn_interruptions），JSON 索引（侧栏快照 items、`app/sessions.json`、
+  `conversationContextUsage.json`），以及已无会话使用的临时工作目录 `~/WorkBuddy/<时间戳>/`
+  （保留非空 `.workbuddy/memory/`）。`logs/`、`audit-log/`、`traces/` 是全局日志，不按会话删。
+- **Cursor**：IDE 会话 = `globalStorage/state.vscdb` 的 `composerHeaders` 行（子代理随父会话级联、
+  `empty-state-draft` 占位不列）；删除 = `cursorDiskKV` 白名单前缀键（`composerData` / `bubbleId` /
+  `checkpointId` / `composerConvHeaders` / `composerTranscriptHeightTail` /
+  `composerRootWriterDiagnostic` / `ofsContent` / `composerDraft`）+ headers 行 +
+  `conversation-search.db` 索引行 + `~/.cursor/projects/*/agent-transcripts/<id>/`。共享内容块
+  `agentKv:blob:*` 引用不透明，不碰。CLI 会话 = `~/.cursor/chats/<hash>/<id>/`（meta.json 给 cwd）。
+  项目壳里的 `mcp-auth.json`、`repo.json` 等文件不碰。
+- **Gemini CLI**（`~/.gemini/tmp/`）：会话 = `chats/session-*.json`；`projects.json` 映射真实路径。
+- **豆包 / Grok Bot（云端型）**：只列 `~/.doubao/chats/<日期>/<名称>/` Agent 工作目录、豆包运行日志 /
+  下载临时目录、Grok 附件暂存与附件 / 链接预览缓存；「缓存」类只清空内容、保留目录。豆包
+  `sdk_storage/<uid>/*.db` 是 SQLCipher 加密消息库（含登录 / 设置），不碰。
 
 **Multica 增强**：当 Claude Code 的项目目录匹配 Multica workspace 模式（`*multica-workspaces-<ws_id>-<task_prefix>-workdir`）时，scan.py 自动：
 1. 查找对应的 `~/multica_workspaces/<ws_id>/<task_id>/` 目录，读取 `.gc_meta.json` 判断任务完成状态
@@ -193,7 +245,8 @@ Claude Code 没有公开可复用的 `~/.claude.json` 锁协议，因此脚本�
 先给一句结论先行的摘要（合计占用 / 占用最大的 Agent / 孤儿数），然后**不再用 AskUserQuestion
 询问**，直接按以下写死的默认决策进入 Step 3：
 
-1. **关闭 ChatGPT / Antigravity：关。** 避免后续删除撞到 app 占用文件；只读扫描已跑完，关不关
+1. **关闭运行中会回写数据的 Agent App：关。**（ChatGPT / Antigravity / WorkBuddy / Cursor / 豆包 /
+   Grok Bot，只关已安装的，宿主永不关。）避免后续删除撞到 app 占用文件；只读扫描已跑完，关不关
    都不影响结果。**说明**：2026-07-10 起 OpenAI 把独立 Codex APP 合并进了 ChatGPT APP，会话
    数据（`~/.codex/`）现由 ChatGPT 进程持有，所以删除前要关的是 ChatGPT。脚本里同时保留
    老的 "Codex" 进程名作为 legacy 兜底。
@@ -209,14 +262,17 @@ Claude Code 没有公开可复用的 `~/.claude.json` 锁协议，因此脚本�
 顺序恒为：**① 关 app → ② 兜底清理 → ③ 生成可删除交互报告 → ④ Step S 摘要。** 默认三项全做、
 逐步执行；仅当用户主动要求偏离（别关 app / 换只读报告 / 不要报告）时，才跳过或替换对应那一步。
 
-**① 关闭 ChatGPT / Antigravity**（默认执行；用户主动说「别关」时才跳过）
+**① 关闭需要退出的 Agent App**（默认执行；用户主动说「别关」时才跳过，说「别关 Cursor」就加 `--skip cursor`）
 
 ```bash
 bash scripts/run.sh close_agents.py
 ```
 
-`close_agents.py` 先 `osascript quit` 优雅退出、等不到再 `pkill` 强制结束，**只关这两类
-app，不动其它进程**。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 ChatGPT 正在运行，
+`close_agents.py` 按 `agent_registry` 清单逐个处理已安装 Agent 的 App：先 `osascript quit` 优雅退出
+（等 5 秒），等不到再 `pkill` 强制结束；**Cursor 不强杀**（编辑器可能有未保存内容，退出失败就请用户
+手动退出）；**宿主 App 跳过**。开头先打印「当前宿主：X」，宿主不合适时提示改在 ZCode 里运行，
+**agent 要把这句提示原样转述给用户**。`--only` / `--skip` 接受逗号分隔的 agent key。只关这些 App，
+不动其它进程。脚本会逐步打印检测与关闭过程（如「⚠ 检测到 ChatGPT 正在运行，
 即将自动关闭 ChatGPT…」「✓ 已关闭 ChatGPT」），**agent 要把这些信息如实转述给用户**。
 
 > **为什么关的是 ChatGPT 而不是 Codex**：OpenAI 已于 2026-07-10 把独立 Codex APP 合并进
@@ -237,7 +293,7 @@ bash scripts/run.sh precleanup.py        # 默认移废纸篓（可逆）；--ha
 bash scripts/run.sh agent_delete.py --codex-ghosts   # Codex 侧栏幽灵清扫 + 各 SQLite 孤儿行清扫（App 已退出，门禁可过）
 ```
 
-清掉四个 Agent 历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
+清掉各 Agent 会话数据子树里历史遗留的**空目录**（含只剩 `.DS_Store` 的），Claude
 `session-env`/`file-history`/`tasks` 里**对应会话已不存在的卫星孤儿**，以及 Claude
 `sessions/<pid>.json` 里**进程已不存在（或 pid 被非 Claude 进程复用）的陈旧运行时状态文件**
 ——某个 Claude CLI 异常退出没清掉自己的状态文件时留下的残渣。同时清扫 Codex 侧栏状态文件
@@ -271,7 +327,7 @@ disown
 脚本自带单实例约束，重复起会自动接管旧实例。用完让用户 `kill <pid>` 停（停掉后删除按钮即失效）。
 
 `server.py` 起在 127.0.0.1 + 随机端口 + 随机 token，把同一套模板注入启用态 `__DELETE_CONFIG__`。
-四栏对比四个 Agent，可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
+按探测结果逐个 Agent 分区对比（运行中需退出的 App 红条提示、🛡 记忆保护行），可展开「项目 → 会话」树；每条会话有「删除」、每个项目有「删除整个项目」、
 每个 Agent 有「🧹 一键清理 N 个孤儿会话」。删除默认移废纸篓（可逆），Codex/索引类硬删项会红色
 二次确认。删除经 `agent_delete.py`，复刻各 Agent 原始清理工具的 removal set（Codex 行+jsonl+
 卫星文件+侧栏状态剪除、Claude jsonl+session 目录、Antigravity 卫星文件 + 侧栏索引 proto 改写）。
@@ -311,6 +367,8 @@ bash scripts/run.sh build_report.py /tmp/session_scan.json ~/Desktop/session-rep
 报告生成后（或配置清理成功后由空态快通道直达此处），在对话里给结论先行的一段话：全部
 Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关注的项，以及 Claude 配置清理删除条目数和
 是否创建备份。细节让用户看 HTML；摘要不得展示任何 `~/.claude.json` 项目键或值。
+摘要还要带上：本次宿主是否合适（`host.fit == "avoid"` 时明确建议改在 ZCode 里重跑）、哪些 Agent 因 App
+未能关闭而无法删除、云端型 Agent 的云端会话需在 App 内删除。
 
 **扫描 JSON 结构**（读它做摘要时照此取值，别猜——`agents` 是 **list** 不是 dict，对它用
 `.items()` 会报错）：
@@ -318,9 +376,13 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 ```jsonc
 {
   "generated_at": 0, "scan_seconds": 0.0, "home": "/Users/<user>",
+  "host": { "key": "zcode", "name": "ZCode", "fit": "recommended", "reason": "...",
+            "recommended": "zcode", "recommended_name": "ZCode" },   // fit: recommended | ok | avoid
   "agents": [                      // ← list，直接遍历
     {
-      "key": "codex",             // codex | antigravity | claude | zcode
+      "key": "codex",             // codex | antigravity | claude | zcode | workbuddy | cursor | gemini | doubao | grok
+      "icon": "🟦", "kind": "local",   // kind: local | cloud（云端型只列本地缓存）
+      "hard_delete": true, "must_close": ["ChatGPT"], "memory": ["~/.codex/AGENTS.md"],
       "name": "Codex",
       "installed": true,           // false 时 projects 为空，跳过
       "note": "...",
@@ -374,7 +436,7 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 两者同构（一模板两入口、扫描只读、网页可一键删），互补之处在范围：
 
 - `storage-analyzer`：扫整机磁盘，按 `🟢自动清理 / 🟡需判断 / 🔴谨慎清理` 给出可执行处置。
-- `session-analyzer`（本 skill）：只扫四个 AI Agent 的会话数据，按「Agent → 项目 → 会话」
+- `session-analyzer`（本 skill）：只扫本机已安装 AI Agent 的会话数据，按「Agent → 项目 → 会话」
   盘点占用，网页上按会话/项目删除，复刻各 Agent 原始清理工具的 removal set。
 
 ## 文件结构
@@ -383,10 +445,16 @@ Agent 合计占用、占用最大的 Agent、孤儿会话总数、最该先关�
 session-analyzer/
 ├── SKILL.md
 ├── scripts/
-│   ├── scan.py                    # 只读扫描四 Agent → JSON（含 Codex 侧栏幽灵标记）
+│   ├── agent_registry.py          # Agent 注册表：探测 / 关闭清单 / 记忆保护 / 宿主判定 / 删除门禁
+│   ├── agent_common.py            # 新插件共用工具（体积、只读 SQLite、JSON 原子改写）
+│   ├── agents_workbuddy.py        # WorkBuddy 扫描 + 删除 + 卫星孤儿兜底
+│   ├── agents_cursor.py           # Cursor IDE / CLI 扫描 + 删除
+│   ├── agents_gemini.py           # Gemini CLI 扫描 + 删除
+│   ├── agents_cloud.py            # 豆包 / Grok Bot 本地缓存扫描 + 清理
+│   ├── scan.py                    # 只读扫描全部已安装 Agent → JSON（含宿主判定、Codex 侧栏幽灵标记）
 │   ├── codex_ui_state.py          # Codex 侧栏状态文件唯一读写入口：解析/白名单剪除/门禁写
 │   ├── cleanup_claude_config.py   # 扫描后过滤 ~/.claude.json 顶层 projects
-│   ├── close_agents.py            # 关闭 ChatGPT（含 Codex）/ Antigravity（默认执行）
+│   ├── close_agents.py            # 按注册表关闭需退出的 App，宿主永不关（默认执行）
 │   ├── precleanup.py              # 开场兜底：清空目录 + Claude 卫星孤儿 + 陈旧进程状态文件（默认废纸篓）
 │   ├── agyhub_summaries.py        # Antigravity 索引 .pb 解析 + 按 id 剔除（scan/删除共用）
 │   ├── build_report.py            # 注入 DELETE_CONFIG=null → 静态只读报告（入口一）
@@ -396,7 +464,9 @@ session-analyzer/
 │   ├── test_scan.py               # Claude cwd/orphan + 快照权限 + Codex 只读回归测试
 │   ├── test_cleanup_claude_config.py # 配置清理安全、session 竞态和备份测试
 │   ├── test_codex_ui_state.py     # 侧栏状态解析/剪除/门禁/幂等/删除链路收尾测试
-│   └── test_report_gate.py        # 清理成功标记与报告入口闸门测试
+│   ├── test_report_gate.py        # 清理成功标记与报告入口闸门测试
+│   ├── test_zcode.py              # ZCode 扫描 / 删除测试
+│   └── test_new_agents.py         # 注册表 / 宿主判定 / WorkBuddy / Cursor / Gemini / 云端型 / 分发测试
 └── assets/
     └── report_template.html       # 报告模板（只读/删除两态，看 __DELETE_CONFIG__ 切换）
 ```

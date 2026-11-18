@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only scan of Codex / Antigravity / Claude Code session data.
+"""Read-only scan of every locally installed AI agent's session data
+(Codex / Antigravity / Claude Code / ZCode / WorkBuddy / Cursor / Gemini CLI / 豆包 / Grok Bot).
 
 Walks each agent's local data dirs, groups sessions into projects, sizes every
 level, flags orphans (whose working dir no longer exists), and emits one JSON
@@ -27,6 +28,11 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote
 
+import agent_registry
+import agents_cloud
+import agents_cursor
+import agents_gemini
+import agents_workbuddy
 import agyhub_summaries
 import codex_ui_state
 
@@ -1180,6 +1186,20 @@ def _write_json_out(path: Path, text: str) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+# 扫描顺序 = 报告展示顺序；新增 Agent 在 agent_registry.AGENTS 注册后加到这里
+SCANNERS = (
+    ("codex", lambda: scan_codex()),
+    ("antigravity", lambda: scan_antigravity()),
+    ("claude", lambda: scan_claude()),
+    ("zcode", lambda: scan_zcode()),
+    ("workbuddy", lambda: agents_workbuddy.scan()),
+    ("cursor", lambda: agents_cursor.scan()),
+    ("gemini", lambda: agents_gemini.scan()),
+    ("doubao", lambda: agents_cloud.scan("doubao")),
+    ("grok", lambda: agents_cloud.scan("grok")),
+)
+
+
 def main() -> int:
     # 支持 --json-out <path>：JSON 直接写文件，避免 stdout/stderr 混叠导致
     # 下游解析失败（bash 重定向、run.sh 包装等场景都可能混进去）。
@@ -1195,11 +1215,24 @@ def main() -> int:
             i += 1
 
     start = time.time()
-    agents = [scan_codex(), scan_antigravity(), scan_claude(), scan_zcode()]
+    agents = []
+    for key, fn in SCANNERS:
+        try:
+            a = fn()
+        except Exception as e:  # 单个 Agent 扫坏不拖垮整体：标注后继续
+            spec = agent_registry.BY_KEY[key]
+            a = {"key": key, "name": spec.name, "root": str(spec.detect[0]),
+                 "installed": agent_registry.is_installed(spec), "projects": [],
+                 "note": f"扫描失败（{e.__class__.__name__}），已跳过", "scan_error": True,
+                 "project_count": 0, "session_count": 0, "total_size": 0,
+                 "orphan_session_count": 0}
+        a.update(agent_registry.meta_for(key))
+        agents.append(a)
     out = {
         "generated_at": int(start),
         "scan_seconds": round(time.time() - start, 1),
         "home": str(HOME),
+        "host": agent_registry.host_info(),
         "agents": agents,
     }
     # 自检：写到 stderr，不污染 JSON。
@@ -1207,6 +1240,8 @@ def main() -> int:
     total_sessions = sum(a["session_count"] for a in agents)
     total_orphans = sum(a["orphan_session_count"] for a in agents)
     total_size = sum(a["total_size"] for a in agents)
+    host = out["host"]
+    print(f"[scan] host={host['name']} fit={host['fit']}", file=sys.stderr)
     print(
         f"[scan] agents={sum(1 for a in agents if a['installed'])} "
         f"sessions={total_sessions} orphans={total_orphans} "

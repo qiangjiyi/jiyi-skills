@@ -3,7 +3,7 @@
 
 Loads a read-only scan JSON, serves the interactive report on 127.0.0.1 + a
 random port + a random per-session token, and exposes POST /action to delete a
-single session or a whole project for Codex / Antigravity / Claude Code.
+single session or a whole project for every scanned agent (see agent_registry.py).
 
 Usage:
     server.py <scan.json>
@@ -34,6 +34,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_delete  # noqa: E402
+import agent_registry  # noqa: E402
+import agents_cloud  # noqa: E402
+import agents_cursor  # noqa: E402
+import agents_gemini  # noqa: E402
+import agents_workbuddy  # noqa: E402
 import cleanup_claude_config  # noqa: E402
 import codex_ui_state  # noqa: E402
 
@@ -235,6 +240,15 @@ def dispatch(agent: str, scope: str, project_id: str, session_id, mode: str) -> 
         return agent_delete.delete_codex_threads(ids, mode)
     if agent == "zcode":
         return agent_delete.delete_zcode_sessions(ids, mode)
+    # 新增 Agent：各插件自带运行门禁（App 未退出 / 会话 10 分钟内活跃 → 拒绝）
+    if agent == "workbuddy":
+        return agents_workbuddy.delete(ids, mode)
+    if agent == "cursor":
+        return agents_cursor.delete(project_id, ids, mode)
+    if agent == "gemini":
+        return agents_gemini.delete(project_id, ids, mode)
+    if agent in ("doubao", "grok"):
+        return agents_cloud.delete(agent, ids, mode)
     raise ValueError("未知 Agent：%s" % agent)
 
 
@@ -254,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             # 幽灵计数/明细每次页面加载都实时重算：流程在起报告前已清扫过时，
             # 快照里的旧计数会虚高误导用户；重算失败则回落到快照值。
+            agent_registry.refresh_running(DATA)
             blob = json.dumps(codex_ui_state.refresh_codex_ghosts(DATA), ensure_ascii=False)
             cfg = json.dumps({"token": TOKEN, "endpoint": "/action", "enabled": True})
             html = TPL.replace("__REPORT_DATA__", blob).replace("__DELETE_CONFIG__", cfg)

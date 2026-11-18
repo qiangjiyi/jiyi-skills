@@ -127,6 +127,7 @@ def prune_roots() -> dict:
     根本身，也绝不越界——空目录有时是程序占位，范围必须收死。"""
     cl, ag, cx = HOME / ".claude", HOME / ".gemini" / "antigravity", HOME / ".codex"
     zc = HOME / ".zcode" / "cli"
+    wb = HOME / ".workbuddy"
     return {
         "claude": [cl / "projects", cl / "session-env", cl / "file-history", cl / "tasks"],
         "antigravity": [ag / "brain", ag / "conversations", ag / "annotations"],
@@ -134,6 +135,10 @@ def prune_roots() -> dict:
         # rollout 下的 model-io-no-session.jsonl 等非会话文件不属于清理范围，空目录
         # 清理只收空目录、不碰文件；exec/bash-startup 等有内容的目录天然不受影响。
         "zcode": [zc / "artifacts", zc / "exec", zc / "image-cache", zc / "agents", zc / "rollout"],
+        # 新增 Agent：只收会话数据子树里的空目录
+        "workbuddy": [wb / "projects", wb / "file-history", wb / "workspace" / "sessions"],
+        "cursor": [HOME / ".cursor" / "chats"],
+        "doubao": [HOME / ".doubao" / "chats"],
     }
 
 
